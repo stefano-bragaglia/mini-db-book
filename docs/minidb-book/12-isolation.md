@@ -74,23 +74,23 @@ Why is "every read is still true at commit" enough for serializability? Because 
 The new error:
 
 ```python
-# minidb/errors.py (append)
+# src/minidb/errors.py (append)
 class ConflictError(DatabaseError):
-    """A concurrent transaction changed something this one read. Retry it."""
+    """Signal that a concurrent transaction changed something this one read; retry it."""
 ```
 
 Tables carry versions. Rowid allocation now happens during planning, *outside* the exclusive lock, so it needs its own small latch. This is exactly Experiment 1 from [§10.2](10-concurrency-i.md#102-breaking-minidb).
 
 ```python
-# minidb/table.py (replace Table.__init__)
-    def __init__(self, schema: TableSchema):
+# src/minidb/table.py (replace Table.__init__)
+    def __init__(self, schema: TableSchema) -> None:
         self.schema = schema
         self.name = schema.name
         self.columns = schema.column_names
         self.rows: dict[int, Row] = {}
-        self.indexes: dict[str, HashIndex] = {}
-        self.version = 0                          # last commit that changed this table
-        self.row_versions: dict[int, int] = {}    # rowid -> last commit that changed it
+        self.indexes: dict[str, Index] = {}
+        self.version = 0  # the last commit that changed this table
+        self.row_versions: dict[int, int] = {}  # rowid -> the last commit that changed it
         self._next_rowid = 1
         self._rowid_latch = threading.Lock()
         if schema.primary_key:
@@ -100,8 +100,15 @@ Tables carry versions. Rowid allocation now happens during planning, *outside* t
 ```
 
 ```python
-# minidb/table.py (replace Table.new_rowid)
+# src/minidb/table.py (replace Table.new_rowid)
     def new_rowid(self) -> int:
+        """Hand out the next rowid; rowids are never reused.
+
+        Planning happens outside the exclusive lock, so the counter has a
+        small latch of its own.
+
+        :return: a rowid no row has ever had.
+        """
         with self._rowid_latch:
             rowid = self._next_rowid
             self._next_rowid += 1
@@ -109,26 +116,50 @@ Tables carry versions. Rowid allocation now happens during planning, *outside* t
 ```
 
 ```python
-# minidb/table.py (imports)
+# src/minidb/table.py (imports)
 import threading
 ```
 
-The database stamps versions as it applies a commit, decides per mode which lock a Unit of Work holds for its lifetime, and gains a `transaction()` helper that retries on conflict:
+The database stamps versions as it applies a commit, decides per mode which lock a Unit of Work holds for its lifetime, and gains a `transaction()` helper that retries on conflict. Two small public methods, `shared_lock()` and `exclusive_lock()`, let Units of Work use the lock without reaching into the database's private attributes:
 
 ```python
-# minidb/database.py (replace Database.__init__)
-    def __init__(self):
+# src/minidb/database.py (replace Database.__init__)
+    def __init__(self, *, lock: RWLock | None = None) -> None:
         self.tables: dict[str, Table] = {}
         self.foreign_keys: list[ForeignKey] = []
-        self.commit_seq = 0                     # number of the last commit
-        self._lock = FairRWLock()
-        self._local = threading.local()         # .uow: this thread's active UoW
+        self.commit_seq = 0  # the number of the last commit
+        self._lock: RWLock = lock if lock is not None else FairRWLock()
+        self._local = threading.local()  # .uow: this thread's active unit of work
+
+    def shared_lock(self) -> AbstractContextManager[None]:
+        """Return a context manager that holds the database lock in shared mode.
+
+        :return: the context manager.
+        """
+        return self._lock.read()
+
+    def exclusive_lock(self) -> AbstractContextManager[None]:
+        """Return a context manager that holds the database lock exclusively.
+
+        :return: the context manager.
+        """
+        return self._lock.write()
 ```
 
 ```python
-# minidb/database.py (replace Database.apply)
-    def apply(self, changes: list[Change]) -> None:
-        """Write validated changes as one commit. The caller holds the write lock."""
+# src/minidb/database.py (typing imports)
+from contextlib import AbstractContextManager
+```
+
+```python
+# src/minidb/database.py (replace Database.apply)
+    def apply(self, changes: Sequence[Change]) -> None:
+        """Write validated changes as one commit, stamping every row with its version.
+
+        The caller holds the exclusive lock.
+
+        :param changes: the changes to write.
+        """
         self.commit_seq += 1
         seq = self.commit_seq
         for c in changes:
@@ -143,10 +174,18 @@ The database stamps versions as it applies a commit, decides per mode which lock
 ```
 
 ```python
-# minidb/database.py (replace Database._begin)
-    def _begin(self, uow) -> None:
-        """Called by a new UnitOfWork. Optimistic ones take no lock at all."""
-        if self._active_uow() is not None:
+# src/minidb/database.py (replace Database.begin)
+    def begin(self, uow: UnitOfWork) -> None:
+        """Register a new unit of work, taking the lock it needs for its lifetime.
+
+        Optimistic units of work take no lock at all; read-only ones share
+        it; exclusive ones hold it alone. Units of work call this
+        themselves; applications don't need to.
+
+        :param uow: the unit of work that is starting.
+        :raises TransactionError: if the thread already has an active one.
+        """
+        if self.active_unit_of_work() is not None:
             raise TransactionError("this thread already has an active unit of work")
         if uow.readonly:
             self._lock.acquire_read()
@@ -156,8 +195,12 @@ The database stamps versions as it applies a commit, decides per mode which lock
 ```
 
 ```python
-# minidb/database.py (replace Database._end)
-    def _end(self, uow) -> None:
+# src/minidb/database.py (replace Database.end)
+    def end(self, uow: UnitOfWork) -> None:
+        """Unregister a finishing unit of work, releasing any lock it held.
+
+        :param uow: the unit of work that is finishing.
+        """
         self._local.uow = None
         if uow.readonly:
             self._lock.release_read()
@@ -166,234 +209,413 @@ The database stamps versions as it applies a commit, decides per mode which lock
 ```
 
 ```python
-# minidb/database.py (replace Database.unit_of_work)
-    def unit_of_work(self, *, deferred: bool = False, readonly: bool = False,
-                     exclusive: bool = False) -> UnitOfWork:
+# src/minidb/database.py (replace Database.unit_of_work)
+    def unit_of_work(self, *, deferred: bool = False, readonly: bool = False, exclusive: bool = False) -> UnitOfWork:
+        """Start a transaction; see :class:`UnitOfWork`.
+
+        :param deferred: whether to check multi-row constraints only at
+            commit; ``False`` by default.
+        :param readonly: whether the transaction only reads; it then holds
+            the lock in shared mode and never conflicts; ``False`` by default.
+        :param exclusive: whether to hold the lock alone for the whole
+            transaction, so it can't conflict; ``False`` by default.
+        :return: a new, active unit of work.
+        """
         return UnitOfWork(self, deferred=deferred, readonly=readonly, exclusive=exclusive)
 
-    def transaction(self, fn, *, retries: int = 5, deferred: bool = False):
-        """Run fn(uow) and commit, retrying on ConflictError.
+    def transaction[T](self, fn: Callable[[UnitOfWork], T], *, retries: int = 5, deferred: bool = False) -> T:
+        """Run ``fn(uow)`` and commit, retrying when another transaction conflicts.
 
-        `fn` may run several times, so it must not have side effects outside
-        the database. After `retries` optimistic attempts, the final attempt
-        runs exclusively and cannot conflict: every transaction finishes.
+        ``fn`` may run several times, so it must not have effects outside
+        the database. After ``retries`` optimistic attempts, the final
+        attempt runs exclusively and can't conflict: every transaction
+        finishes.
+
+        >>> from minidb.schema import Column
+        >>> from minidb.types import Integer
+        >>> db = Database()
+        >>> _ = db.create_table("t", [Column("n", Integer())])
+        >>> db.transaction(lambda uow: uow.insert("t", {"n": 1}))
+        1
+
+        :param fn: the work to do, given a fresh unit of work each time.
+        :param retries: the optimistic attempts before the exclusive one; 5 by default.
+        :param deferred: whether to defer multi-row checks to commit; ``False`` by default.
+        :return: whatever ``fn`` returned on the attempt that committed.
+        :raises DatabaseError: whatever ``fn`` or the commit raised, other
+            than a conflict.
         """
-        for attempt in range(retries + 1):
-            uow = self.unit_of_work(deferred=deferred, exclusive=(attempt == retries))
+        for attempt in range(retries):
             try:
-                result = fn(uow)
-                uow.commit()
-                return result
+                return self._attempt(self.unit_of_work(deferred=deferred), fn)
             except ConflictError:
+                time.sleep(random.uniform(0, 0.0005 * 2**attempt))  # noqa: S311 - back-off jitter, not cryptography
+        return self._attempt(self.unit_of_work(deferred=deferred, exclusive=True), fn)
+
+    @staticmethod
+    def _attempt[T](uow: UnitOfWork, fn: Callable[[UnitOfWork], T]) -> T:
+        try:
+            result = fn(uow)
+            uow.commit()
+        except BaseException:
+            if uow.state == "active":
                 uow.rollback()
-                time.sleep(random.uniform(0, 0.0005 * 2 ** attempt))   # back off
-            except BaseException:
-                if uow.state == "active":
-                    uow.rollback()
-                raise
+            raise
+        return result
 ```
 
 ```python
-# minidb/database.py (replace Database.insert)
-    def insert(self, table: str, values: Row) -> int:
+# src/minidb/database.py (replace Database.insert)
+    def insert(self, table: str, values: Mapping[str, object]) -> int:
+        """Insert a row, in a transaction of its own.
+
+        :param table: the table's name.
+        :param values: the new row's values, by column name.
+        :return: the new rowid.
+        :raises ConstraintError: if the row breaks a constraint.
+        """
         return self.transaction(lambda uow: uow.insert(table, values))
 ```
 
 ```python
-# minidb/database.py (replace Database.update)
-    def update(self, table: str, changes: Row, where: Where = None) -> int:
+# src/minidb/database.py (replace Database.update)
+    def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
+        """Update rows, in a transaction of its own.
+
+        :param table: the table's name.
+        :param changes: the new values, by column name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
+        :return: the number of rows changed.
+        :raises ConstraintError: if a new row breaks a constraint.
+        """
         return self.transaction(lambda uow: uow.update(table, changes, where))
 ```
 
 ```python
-# minidb/database.py (replace Database.delete)
+# src/minidb/database.py (replace Database.delete)
     def delete(self, table: str, where: Where = None) -> int:
+        """Delete rows and their cascades, in a transaction of its own.
+
+        :param table: the table's name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
+        :return: the number of rows deleted from ``table`` itself.
+        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
+        """
         return self.transaction(lambda uow: uow.delete(table, where))
 ```
 
 ```python
-# minidb/database.py (imports)
+# src/minidb/database.py (imports)
 import random
 import time
+
 from minidb.errors import ConflictError
 ```
 
 ```python
-# minidb/__init__.py (append)
-from minidb.errors import ConflictError
-__all__ += ["ConflictError"]
+# src/minidb/database.py (typing imports)
+from collections.abc import Callable
 ```
+
+```python
+# src/minidb/__init__.py (replace __all__)
+__all__ = [
+    "Avg",
+    "Boolean",
+    "Change",
+    "Check",
+    "CheckError",
+    "Column",
+    "ConflictError",
+    "ConstraintError",
+    "Count",
+    "Database",
+    "DatabaseError",
+    "Date",
+    "DomainError",
+    "FairRWLock",
+    "ForeignKey",
+    "ForeignKeyError",
+    "Integer",
+    "Max",
+    "Min",
+    "NotNullError",
+    "Numeric",
+    "Query",
+    "Real",
+    "Record",
+    "SchemaError",
+    "Sum",
+    "TableSchema",
+    "Text",
+    "Timestamp",
+    "TransactionError",
+    "UniqueError",
+    "UnitOfWork",
+    "normalizers",
+]
+```
+
+```python
+# src/minidb/__init__.py (imports)
+from minidb.errors import ConflictError
+```
+
+`transaction` is a generic method, written with the new syntax `def transaction[T](self, fn: Callable[[UnitOfWork], T], …) -> T`. Whatever type `fn` returns, `transaction` returns the same type: `db.transaction(lambda uow: uow.insert(…))` is known to be an `int`.
 
 Note the **exclusive fallback** in `transaction()`. Optimistic schemes have a fairness problem of their own: a long transaction that reads a lot can lose validation again and again to a stream of short ones. That's starvation, reappearing one level up from [Chapter 11](11-readers-writer-locks.md). Falling back to the exclusive lock after a few failures bounds the number of attempts. The exclusive attempt still has to wait its turn in the FairRWLock queue, so its wait is bounded too.
 
-The Unit of Work changes in many small places, so here is the whole module. The new parts are the read set in `TableView`, `conflicts()`, `_latch()` and the three commit paths.
+The Unit of Work changes in many small places, so here is the whole module. The new parts are the read set in `TableView`, `conflicts()`, `latch()` and the three commit paths.
 
 ```python
-# minidb/uow.py
-"""The Unit of Work: a private workspace, an identity map, atomic commit.
+# src/minidb/uow.py
+"""Group writes into all-or-nothing transactions: the Unit of Work.
 
 Version 3: optimistic concurrency control. A read-write unit of work holds
 no lock while it runs. It records what it read (its *read set*), and at
-commit, under the exclusive lock, checks that none of it has changed.
+commit, under the exclusive lock, checks that all of it is still true.
 """
-from collections.abc import Iterator, Mapping
+
 from contextlib import nullcontext
 from types import MappingProxyType
+from typing import TYPE_CHECKING
+from typing import Self
 
 from minidb import changes as ch
-from minidb.changes import Change
-from minidb.errors import ConflictError, DatabaseError
+from minidb.errors import ConflictError
+from minidb.errors import DatabaseError
 from minidb.query import Query
 
-type Row = dict[str, object]
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from collections.abc import Mapping
+    from collections.abc import Sequence
+    from contextlib import AbstractContextManager
+    from types import TracebackType
+
+    from minidb.changes import Change
+    from minidb.database import Database
+    from minidb.schema import ForeignKey
+    from minidb.table import Table
+    from minidb.table import Where
+    from minidb.values import Row
+    from minidb.values import Value
+
+type ReadKey = tuple[str, tuple[tuple[str, Value | None], ...]]  # ("lookup" | "match", frozen key)
 
 
 class TransactionError(DatabaseError):
-    """The Unit of Work was used in the wrong state (e.g. after commit)."""
+    """Signal that a unit of work was used in the wrong state, e.g. after commit."""
 
 
 class TableView:
-    """A table as one unit of work sees it: committed rows + private overlay.
+    """Show a table as one unit of work sees it, recording every read of committed data.
 
-    Every read of committed data happens under a short shared latch and is
-    recorded in the read set, so commit can check it is still true.
+    Each read of the committed table happens under a short shared latch,
+    and is remembered in the view's read set, so that commit can check it
+    is still true.
+
+    :param uow: the unit of work this view belongs to.
+    :param table: the committed table.
     """
 
-    def __init__(self, uow, table):
+    def __init__(self, uow: UnitOfWork, table: Table) -> None:
         self.uow, self.base = uow, table
         self.name, self.schema, self.columns = table.name, table.schema, table.columns
-        self.overlay: dict[int, Row | None] = {}          # rowid -> row, None = deleted
-        # -- the read set ------------------------------------------------------------
-        self.scanned_version: int | None = None            # table version at first scan
-        self.row_reads: dict[int, int | None] = {}         # rowid -> row version read
-        self.key_reads: dict[tuple, frozenset[int]] = {}   # equality read -> rowids seen
+        self.overlay: dict[int, Row | None] = {}  # rowid -> row, None = deleted
+        # -- the read set -------------------------------------------------------------
+        self.scanned_version: int | None = None  # table version at the first scan
+        self.row_reads: dict[int, int | None] = {}  # rowid -> row version read
+        self.key_reads: dict[ReadKey, frozenset[int]] = {}  # equality read -> rowids seen
 
-    # -- reads of committed data (latched and recorded) ---------------------------------
+    # -- reads of committed data, latched and recorded ----------------------------------
     def _base_row(self, rowid: int) -> Row | None:
-        with self.uow._latch():
+        with self.uow.latch():
             row = self.base.rows.get(rowid)
             self.row_reads.setdefault(rowid, self.base.row_versions.get(rowid))
         return row
 
     def _base_items(self) -> list[tuple[int, Row]]:
-        with self.uow._latch():
+        with self.uow.latch():
             items = list(self.base.rows.items())
             if self.scanned_version is None:
                 self.scanned_version = self.base.version
         return items
 
-    def _base_equal(self, kind: str, key: Mapping[str, object]) -> set[int]:
-        with self.uow._latch():
-            found = (self.base.lookup(key) if kind == "lookup"
-                     else set(self.base.match(key)))
+    def _base_equal(self, kind: str, key: Mapping[str, Value | None]) -> set[int]:
+        with self.uow.latch():
+            found = self.base.lookup(key) if kind == "lookup" else set(self.base.match(key))
         self.key_reads.setdefault((kind, _freeze(key)), frozenset(found))
         return found
 
     # -- the interface used by planners and queries ------------------------------------
     def row(self, rowid: int) -> Row:
+        """Return the row as this transaction sees it.
+
+        :param rowid: the row to fetch.
+        :return: the row; callers must never mutate it.
+        :raises KeyError: if the row doesn't exist here.
+        """
         row = self.overlay[rowid] if rowid in self.overlay else self._base_row(rowid)
         if row is None:
             raise KeyError(rowid)
         return row
 
     def get(self, rowid: int) -> Row | None:
+        """Return a copy of the row, or ``None`` if it doesn't exist here.
+
+        :param rowid: the row to fetch.
+        :return: a copy of the row, or ``None``.
+        """
         try:
             return dict(self.row(rowid))
         except KeyError:
             return None
 
     def scan(self) -> Iterator[tuple[int, Row]]:
+        """Yield every ``(rowid, row)`` pair this transaction sees, rows copied.
+
+        The committed rows are copied under the latch, and iterated without
+        it: a lock must never be held across a ``yield``.
+
+        :return: committed rows (as changed here), then rows inserted here.
+        """
         items = self._base_items()
-        seen = set()
+        seen: set[int] = set()
         for rowid, row in items:
             seen.add(rowid)
-            if rowid in self.overlay:
-                row = self.overlay[rowid]
-                if row is None:
-                    continue
-            yield rowid, dict(row)
-        for rowid, row in list(self.overlay.items()):     # rows inserted here
+            current = self.overlay.get(rowid, row)
+            if current is not None:
+                yield rowid, dict(current)
+        for rowid, row in list(self.overlay.items()):  # rows inserted here
             if row is not None and rowid not in seen:
                 yield rowid, dict(row)
 
-    def match(self, where=None) -> list[int]:
+    def match(self, where: Where = None) -> list[int]:
+        """Return the rowids matching ``where``; see :meth:`Table.match`.
+
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: the matching rowids.
+        """
         if where is None or callable(where):
-            return [rid for rid, row in self.scan()
-                    if where is None or where(MappingProxyType(row))]
+            return [rid for rid, row in self.scan() if where is None or where(MappingProxyType(row))]
         wanted = {c: self.schema.column(c).prepare(v) for c, v in where.items()}
         found = [rid for rid in self._base_equal("match", wanted) if rid not in self.overlay]
-        found += [rid for rid, row in self.overlay.items()
-                  if row is not None and _equal(row, wanted)]
+        found += [rid for rid, row in self.overlay.items() if row is not None and _equal(row, wanted)]
         return found
 
-    def lookup(self, key: Mapping[str, object]) -> set[int]:
+    def lookup(self, key: Mapping[str, Value | None]) -> set[int]:
+        """Return the rowids whose columns equal ``key``, as the index would.
+
+        :param key: ``{column: value}``.
+        :return: the matching rowids.
+        :raises SchemaError: if no index covers exactly these columns.
+        """
         found = {rid for rid in self._base_equal("lookup", key) if rid not in self.overlay}
-        found |= {rid for rid, row in self.overlay.items()
-                  if row is not None and _equal(row, key)}
+        found |= {rid for rid, row in self.overlay.items() if row is not None and _equal(row, key)}
         return found
 
-    def select(self, where=None) -> list[Row]:
+    def select(self, where: Where = None) -> list[Row]:
+        """Return copies of the rows matching ``where``.
+
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: the matching rows.
+        """
         return [dict(self.row(rid)) for rid in self.match(where)]
 
     def unique_keys(self) -> list[tuple[str, ...]]:
+        """Return the column tuples of every unique index of the table.
+
+        :return: one tuple of column names per unique index.
+        """
         return self.base.unique_keys()
 
-    def index_on(self, columns):
-        return self.base.index_on(columns)
-
     def new_rowid(self) -> int:
+        """Hand out a new rowid from the table's counter.
+
+        :return: a rowid nobody has ever had.
+        """
         return self.base.new_rowid()
 
     def __len__(self) -> int:
         return sum(1 for _ in self.scan())
 
-    # -- validation (caller holds the exclusive lock) ------------------------------------
+    # -- validation; the caller holds the exclusive lock ----------------------------------
     def conflicts(self) -> str | None:
-        """Describe the first read that is no longer true, or None."""
-        b = self.base
-        if self.scanned_version is not None and b.version != self.scanned_version:
+        """Describe the first recorded read that is no longer true.
+
+        :return: a description of the conflict, or ``None`` if every read
+            still holds.
+        """
+        return self._scan_conflict() or self._row_conflict() or self._key_conflict()
+
+    def _scan_conflict(self) -> str | None:
+        if self.scanned_version is not None and self.base.version != self.scanned_version:
             return f"{self.name} changed since it was scanned"
+        return None
+
+    def _row_conflict(self) -> str | None:
         for rowid, version in self.row_reads.items():
-            if b.row_versions.get(rowid) != version:
+            if self.base.row_versions.get(rowid) != version:
                 return f"{self.name} row {rowid} changed since it was read"
+        return None
+
+    def _key_conflict(self) -> str | None:
         for (kind, key), seen in self.key_reads.items():
-            now = b.lookup(dict(key)) if kind == "lookup" else set(b.match(dict(key)))
+            now = self.base.lookup(dict(key)) if kind == "lookup" else set(self.base.match(dict(key)))
             if frozenset(now) != seen:
                 return f"{self.name} rows matching {dict(key)} changed"
         return None
 
 
-def _equal(row: Mapping, key: Mapping) -> bool:
-    """SQL equality on every column of `key`: NULL never equals anything."""
+def _equal(row: Mapping[str, Value | None], key: Mapping[str, Value | None]) -> bool:
+    """Compare like SQL on every column of ``key``: NULL never equals anything."""
     return all(v is not None and row[c] == v for c, v in key.items())
 
 
-def _freeze(key: Mapping[str, object]) -> tuple:
+def _freeze(key: Mapping[str, Value | None]) -> tuple[tuple[str, Value | None], ...]:
     return tuple(sorted(key.items(), key=lambda kv: kv[0]))
 
 
-class Record(dict):
-    """A row loaded through a unit of work. Mutate it; commit saves it."""
+class Record(dict[str, "Value | None"]):
+    """Hold a row loaded through a unit of work; mutate it, and commit saves it.
 
-    def __init__(self, table: str, rowid: int, row: Row):
+    :param table: the table the row is in.
+    :param rowid: the row's rowid.
+    :param row: its current values.
+    """
+
+    def __init__(self, table: str, rowid: int, row: Row) -> None:
         super().__init__(row)
         self.table, self.rowid = table, rowid
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Record({self.table}#{self.rowid}, {dict.__repr__(self)})"
 
 
-class UnitOfWork:
-    """Plan into a private workspace; validate and apply at commit.
+_MISSING = object()
 
-    Modes:
-      default        optimistic: no lock while running, validate at commit
-      readonly=True  shared lock for the whole unit of work; no writes
-      exclusive=True exclusive lock for the whole unit of work; never conflicts
+
+class UnitOfWork:
+    """Plan writes into a private workspace; validate and apply them at commit.
+
+    There are three modes. By default the unit of work is *optimistic*: it
+    holds no lock while running, and validates its read set at commit. With
+    ``readonly=True`` it holds the lock in shared mode for its whole life,
+    and may not write. With ``exclusive=True`` it holds the lock alone for
+    its whole life, so it never conflicts.
+
+    :param db: the database to write to.
+    :param deferred: whether to check uniqueness and references only at
+        commit; ``False`` by default.
+    :param readonly: whether the transaction only reads; ``False`` by default.
+    :param exclusive: whether to hold the lock throughout; ``False`` by default.
+    :raises ValueError: if both ``readonly`` and ``exclusive`` are set.
     """
 
-    def __init__(self, db, *, deferred: bool = False, readonly: bool = False,
-                 exclusive: bool = False):
+    def __init__(
+        self, db: Database, *, deferred: bool = False, readonly: bool = False, exclusive: bool = False
+    ) -> None:
         if readonly and exclusive:
             raise ValueError("a unit of work cannot be both readonly and exclusive")
         self.db = db
@@ -406,23 +628,40 @@ class UnitOfWork:
         self._identity: dict[tuple[str, int], Record] = {}
         self._snapshots: dict[tuple[str, int], Row] = {}
         self._committing = False
-        db._begin(self)
+        db.begin(self)
 
-    def _latch(self):
-        """The short lock around each read of committed data."""
+    def latch(self) -> AbstractContextManager[None]:
+        """Return the short lock to hold around each read of committed data.
+
+        It does nothing when the unit of work already holds the lock: being
+        read-only or exclusive, or in the middle of committing.
+
+        :return: a context manager.
+        """
         if self.readonly or self.exclusive or self._committing:
-            return nullcontext()                  # we already hold the lock
-        return self.db._lock.read()
+            return nullcontext()
+        return self.db.shared_lock()
 
-    def reading(self):
-        return nullcontext(self)                  # views latch each read themselves
+    def reading(self) -> nullcontext[Self]:
+        """Return a context manager for queries, which does nothing: views latch each read.
+
+        :return: a context manager that yields the unit of work.
+        """
+        return nullcontext(self)
 
     # -- the planner "state" interface ---------------------------------------------------
     @property
-    def foreign_keys(self):
+    def foreign_keys(self) -> Sequence[ForeignKey]:
+        """Return the database's foreign keys."""
         return self.db.foreign_keys
 
     def table(self, name: str) -> TableView:
+        """Return this transaction's view of the table called ``name``.
+
+        :param name: the table's name.
+        :return: the view, created on first use.
+        :raises SchemaError: if there is no such table.
+        """
         view = self._views.get(name)
         if view is None:
             view = self._views[name] = TableView(self, self.db.table(name))
@@ -430,20 +669,48 @@ class UnitOfWork:
 
     # -- writes: plan now, against the workspace -------------------------------------------
     def insert(self, table: str, values: Mapping[str, object]) -> int:
+        """Insert a row into the workspace.
+
+        :param table: the table's name.
+        :param values: the new row's values, by column name.
+        :return: the new rowid.
+        :raises ConstraintError: if the row breaks a constraint.
+        :raises TransactionError: if the unit of work is no longer active,
+            or is read-only.
+        """
         self._require_active(writing=True)
         self.flush()
         changes = ch.plan_insert(self, table, values, check=not self.deferred)
         self._record(changes)
         return changes[0].rowid
 
-    def update(self, table: str, changes: Mapping[str, object], where=None) -> int:
+    def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
+        """Update rows in the workspace.
+
+        :param table: the table's name.
+        :param changes: the new values, by column name.
+        :param where: which rows change; ``None`` (the default) for all.
+        :return: the number of rows changed.
+        :raises ConstraintError: if a new row breaks a constraint.
+        :raises TransactionError: if the unit of work is no longer active,
+            or is read-only.
+        """
         self._require_active(writing=True)
         self.flush()
         planned = ch.plan_update(self, table, changes, where, check=not self.deferred)
         self._record(planned)
         return len(planned)
 
-    def delete(self, table: str, where=None) -> int:
+    def delete(self, table: str, where: Where = None) -> int:
+        """Delete rows, and their cascades, from the workspace.
+
+        :param table: the table's name.
+        :param where: which rows go; ``None`` (the default) for all.
+        :return: the number of rows deleted from ``table`` itself.
+        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
+        :raises TransactionError: if the unit of work is no longer active,
+            or is read-only.
+        """
         self._require_active(writing=True)
         self.flush()
         planned = ch.plan_delete(self, table, where, check=not self.deferred)
@@ -451,21 +718,32 @@ class UnitOfWork:
         return sum(1 for c in planned if c.table == table and c.kind == "delete")
 
     def _record(self, changes: list[Change]) -> None:
+        """Put planned changes into the overlays, and keep loaded records current."""
         for c in changes:
             self.table(c.table).overlay[c.rowid] = c.after
             self._changes.append(c)
             key = (c.table, c.rowid)
             if key in self._identity:
-                if c.after is None:
-                    del self._identity[key], self._snapshots[key]
-                else:
-                    record = self._identity[key]
-                    record.clear()
-                    record.update(c.after)
-                    self._snapshots[key] = dict(c.after)
+                self._refresh(key, c.after)
+
+    def _refresh(self, key: tuple[str, int], after: Row | None) -> None:
+        if after is None:
+            del self._identity[key], self._snapshots[key]
+            return
+        record = self._identity[key]
+        record.clear()
+        record.update(after)
+        self._snapshots[key] = dict(after)
 
     # -- reads -------------------------------------------------------------------------
     def get(self, table: str, rowid: int) -> Record | None:
+        """Return the row as a tracked :class:`Record`; one object per row.
+
+        :param table: the table's name.
+        :param rowid: the row to load.
+        :return: the record, or ``None`` if the row doesn't exist here.
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         key = (table, rowid)
         if key in self._identity:
@@ -477,39 +755,67 @@ class UnitOfWork:
         self._snapshots[key] = dict(row)
         return record
 
-    def find(self, table: str, where=None) -> list[Record]:
-        self.flush()
-        return [self.get(table, rid) for rid in self.table(table).match(where)]
+    def find(self, table: str, where: Where = None) -> list[Record]:
+        """Return the matching rows as tracked records.
 
-    def select(self, table: str, where=None) -> list[Row]:
+        :param table: the table's name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: one record per matching row.
+        """
+        self.flush()
+        records = [self.get(table, rid) for rid in self.table(table).match(where)]
+        return [r for r in records if r is not None]
+
+    def select(self, table: str, where: Where = None) -> list[Row]:
+        """Return copies of the matching rows, as this transaction sees them.
+
+        :param table: the table's name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: the matching rows.
+        """
         self.flush()
         return self.table(table).select(where)
 
     def query(self, table: str, alias: str | None = None) -> Query:
+        """Start a query that sees this transaction's changes.
+
+        :param table: the first table.
+        :param alias: its alias; ``None`` (the default) uses its name.
+        :return: a query to extend and run.
+        """
         self.flush()
         return Query(self, table, alias)
 
     # -- dirty checking ---------------------------------------------------------------------
     def flush(self) -> None:
+        """Turn modifications of loaded records into planned updates.
+
+        :raises ConstraintError: if a modified record breaks a constraint.
+        :raises TransactionError: if a record was modified in a read-only
+            unit of work.
+        """
         for key, record in list(self._identity.items()):
             before = self._snapshots[key]
             if record != before:
                 self._require_active(writing=True)
                 diff = {c: v for c, v in record.items() if before.get(c, _MISSING) != v}
-                planned = ch.plan_update(self, key[0], diff, rowids=[key[1]],
-                                         check=not self.deferred)
-                self._record(planned)
+                self._record(ch.plan_update(self, key[0], diff, rowids=[key[1]], check=not self.deferred))
 
     # -- finishing ---------------------------------------------------------------------
     def commit(self) -> None:
+        """Flush, then validate and apply, in the way this unit of work's mode requires.
+
+        :raises ConflictError: if an optimistic unit of work read something
+            that has changed since; it then stays active, for a rollback.
+        :raises ConstraintError: if a deferred check fails.
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self.flush()
-        if self.readonly:
-            pass                                  # nothing to write, nothing to check
-        elif self.exclusive:
-            self._apply()                         # nobody else ran: nothing to validate
-        else:
-            with self.db._lock.write():           # the only exclusive section
+        if self.exclusive:
+            self._apply()  # nobody else ran: nothing to validate
+        elif not self.readonly:
+            with self.db.exclusive_lock():  # the only exclusive section
                 self._committing = True
                 try:
                     self._validate()
@@ -517,7 +823,7 @@ class UnitOfWork:
                 finally:
                     self._committing = False
         self.state = "committed"
-        self.db._end(self)
+        self.db.end(self)
 
     def _validate(self) -> None:
         for view in self._views.values():
@@ -531,23 +837,29 @@ class UnitOfWork:
         self.db.apply(ch.net_changes(self._changes))
 
     def rollback(self) -> None:
+        """Forget every change and release any lock held.
+
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self._views.clear()
         self._changes.clear()
         self._identity.clear()
         self.state = "rolled back"
-        self.db._end(self)
+        self.db.end(self)
 
-    def _require_active(self, writing: bool = False) -> None:
+    def _require_active(self, *, writing: bool = False) -> None:
         if self.state != "active":
             raise TransactionError(f"unit of work is already {self.state}")
         if writing and self.readonly:
             raise TransactionError("cannot write in a read-only unit of work")
 
-    def __enter__(self) -> "UnitOfWork":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
         if self.state != "active":
             return
         if exc_type is not None:
@@ -558,9 +870,6 @@ class UnitOfWork:
         except BaseException:
             self.rollback()
             raise
-
-
-_MISSING = object()
 ```
 
 Points worth noticing:
@@ -666,33 +975,67 @@ A **phantom** through a constraint. Two transactions insert the same new key con
 1
 ```
 
-Finally, a stress test. Eight threads each increment a shared counter 200 times through `transaction()`. Every increment conflicts with every concurrent one, yet none is lost, and every transaction finishes:
+Finally, a stress test, `examples/counter.py`. Eight threads each increment a shared counter 200 times through `transaction()`. Every increment conflicts with every concurrent one, yet none is lost, and every transaction finishes:
 
 ```python
-# run
-import sys, threading
-from minidb import *
+# examples/counter.py
+"""Increment one shared counter from eight threads, through ``Database.transaction``.
 
-db = Database()
-db.create_table("counter", [Column("id", Integer()), Column("n", Integer())], primary_key="id")
-db.insert("counter", {"id": 1, "n": 0})
-attempts = []
+Every increment conflicts with every concurrent one, so this is the worst
+case for optimistic concurrency; the test is that no increment is lost.
+"""
 
-def increment(uow):
+import sys
+import threading
+
+from minidb import Column
+from minidb import Database
+from minidb import Integer
+from minidb import UnitOfWork
+
+THREADS, INCREMENTS = 8, 200
+
+
+def increment(uow: UnitOfWork, attempts: list[int]) -> None:
+    """Add one to the counter, recording the attempt.
+
+    :param uow: the transaction to work in.
+    :param attempts: one entry is appended per attempt, retries included.
+    """
     attempts.append(1)
-    uow.find("counter", {"id": 1})[0]["n"] += 1
+    record = uow.find("counter", {"id": 1})[0]
+    record["n"] = int(record["n"] or 0) + 1
 
-def worker():
-    for _ in range(200):
-        db.transaction(increment)
 
-threads = [threading.Thread(target=worker) for _ in range(8)]
-for t in threads: t.start()
-for t in threads: t.join()
-n = db.select("counter")[0]["n"]
-print(f"GIL={sys._is_gil_enabled()} n={n} attempts={len(attempts)} "
-      f"conflicts={len(attempts) - n}")
-assert n == 1600
+def worker(db: Database, attempts: list[int]) -> None:
+    """Increment the counter ``INCREMENTS`` times, retrying on conflicts.
+
+    :param db: the database.
+    :param attempts: where :func:`increment` records its attempts.
+    """
+    for _ in range(INCREMENTS):
+        db.transaction(lambda uow: increment(uow, attempts))
+
+
+def main() -> None:
+    """Run the threads, then print the counter and the number of retries."""
+    db = Database()
+    db.create_table("counter", [Column("id", Integer()), Column("n", Integer())], primary_key="id")
+    db.insert("counter", {"id": 1, "n": 0})
+    attempts: list[int] = []
+    threads = [threading.Thread(target=worker, args=(db, attempts)) for _ in range(THREADS)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    n = int(db.select("counter")[0]["n"] or 0)
+    gil = getattr(sys, "_is_gil_enabled", lambda: True)()
+    print(f"GIL={gil} n={n} attempts={len(attempts)} conflicts={len(attempts) - n}")
+    assert n == THREADS * INCREMENTS
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ```text
@@ -738,6 +1081,8 @@ Neither is "right". Fairness bounds the *worst-case* wait. Unfair locks often gi
 7. **MVCC.** Instead of holding a shared lock, a read-only transaction could read a *snapshot*: each table keeps old row versions tagged by commit number, and a reader started at commit 41 sees each row as it was at commit 41. Sketch the changes to `Table.put`/`remove` and to `TableView`. When can old versions be thrown away?
 8. A single `uow.insert` takes the shared latch several times: once per lookup (primary key, each unique key, each foreign-key parent). Under a fair lock, each acquisition may wait behind a whole queue. Change the Unit of Work to take the latch *once per operation* instead, and re-run the measurement in §12.6.
 9. *(Thought experiment)* Our validation needs the exclusive lock, so commits are serialized. Is that a bottleneck? How long does a commit hold the lock, as a function of the transaction's read set and write set?
+
+*Answers: [Appendix D, Chapter 12](appendix-d-answers.md#chapter-12--isolation).*
 
 ---
 

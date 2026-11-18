@@ -35,91 +35,147 @@ A `TableView` wraps a committed `Table` and adds an **overlay**: a dict from row
 The view implements the table interface the planners use (`schema`, `row`, `match`, `lookup`, `unique_keys`, `new_rowid`), plus `scan`, `columns` and `select` for queries. That's why we wrote the planners against an interface in [§8.2](08-unit-of-work-i.md#82-the-planning-module): they now work on a transaction's view with no changes at all.
 
 ```python
-# minidb/uow.py
-"""The Unit of Work: a private workspace, an identity map, atomic commit."""
-from collections.abc import Iterator, Mapping
+# src/minidb/uow.py
+"""Group writes into all-or-nothing transactions: the Unit of Work.
+
+Version 2: every operation is planned at once against a private workspace,
+and the shared tables are only touched when :meth:`UnitOfWork.commit`
+applies the transaction's net changes in one step.
+"""
+
 from types import MappingProxyType
+from typing import TYPE_CHECKING
+from typing import Self
 
 from minidb import changes as ch
-from minidb.changes import Change
 from minidb.errors import DatabaseError
 from minidb.query import Query
 
-type Row = dict[str, object]
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from collections.abc import Mapping
+    from collections.abc import Sequence
+    from types import TracebackType
+
+    from minidb.changes import Change
+    from minidb.database import Database
+    from minidb.schema import ForeignKey
+    from minidb.table import Table
+    from minidb.table import Where
+    from minidb.values import Row
+    from minidb.values import Value
 
 
 class TransactionError(DatabaseError):
-    """The Unit of Work was used in the wrong state (e.g. after commit)."""
+    """Signal that a unit of work was used in the wrong state, e.g. after commit."""
 
 
 class TableView:
-    """A table as one unit of work sees it: committed rows + private overlay."""
+    """Show a table as one unit of work sees it: committed rows plus a private overlay.
 
-    def __init__(self, table):
+    Reads look in the overlay first and fall through to the table; writes
+    only touch the overlay. The view satisfies the same protocols as a
+    table (:class:`~minidb.changes.TableLike` and
+    :class:`~minidb.operators.Source`), so planners and queries work on it
+    unchanged.
+
+    :param table: the committed table.
+    """
+
+    def __init__(self, table: Table) -> None:
         self.base = table
         self.name, self.schema, self.columns = table.name, table.schema, table.columns
-        self.overlay: dict[int, Row | None] = {}          # rowid -> row, None = deleted
+        self.overlay: dict[int, Row | None] = {}  # rowid -> row, None = deleted
 
-    # -- the interface used by planners and queries ------------------------------------
     def row(self, rowid: int) -> Row:
-        if rowid in self.overlay:
-            row = self.overlay[rowid]
-            if row is None:
-                raise KeyError(rowid)
-            return row
-        return self.base.row(rowid)
+        """Return the row as this transaction sees it.
+
+        :param rowid: the row to fetch.
+        :return: the row; callers must never mutate it.
+        :raises KeyError: if the row doesn't exist, or this transaction
+            deleted it.
+        """
+        row = self.overlay[rowid] if rowid in self.overlay else self.base.row(rowid)
+        if row is None:
+            raise KeyError(rowid)
+        return row
 
     def get(self, rowid: int) -> Row | None:
+        """Return a copy of the row, or ``None`` if it doesn't exist here.
+
+        :param rowid: the row to fetch.
+        :return: a copy of the row, or ``None``.
+        """
         try:
             return dict(self.row(rowid))
         except KeyError:
             return None
 
     def scan(self) -> Iterator[tuple[int, Row]]:
+        """Yield every ``(rowid, row)`` pair this transaction sees, rows copied.
+
+        :return: committed rows (as changed here), then rows inserted here.
+        """
         for rowid, row in self.base.rows.items():
-            if rowid in self.overlay:
-                row = self.overlay[rowid]
-                if row is None:
-                    continue
-            yield rowid, dict(row)
-        for rowid, row in self.overlay.items():           # rows inserted here
+            current = self.overlay.get(rowid, row)
+            if current is not None:
+                yield rowid, dict(current)
+        for rowid, row in self.overlay.items():  # rows inserted here
             if row is not None and rowid not in self.base.rows:
                 yield rowid, dict(row)
 
-    def match(self, where=None) -> list[int]:
+    def match(self, where: Where = None) -> list[int]:
+        """Return the rowids matching ``where``; see :meth:`Table.match`.
+
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: the matching rowids.
+        """
         if where is None or callable(where):
-            return [rid for rid, row in self.scan()
-                    if where is None or where(MappingProxyType(row))]
+            return [rid for rid, row in self.scan() if where is None or where(MappingProxyType(row))]
         wanted = {c: self.schema.column(c).prepare(v) for c, v in where.items()}
         found = [rid for rid in self.base.match(wanted) if rid not in self.overlay]
-        found += [rid for rid, row in self.overlay.items()
-                  if row is not None and _equal(row, wanted)]
+        found += [rid for rid, row in self.overlay.items() if row is not None and _equal(row, wanted)]
         return found
 
-    def lookup(self, key: Mapping[str, object]) -> set[int]:
+    def lookup(self, key: Mapping[str, Value | None]) -> set[int]:
+        """Return the rowids whose columns equal ``key``, as the index would.
+
+        :param key: ``{column: value}``.
+        :return: the matching rowids.
+        :raises SchemaError: if no index covers exactly these columns.
+        """
         found = {rid for rid in self.base.lookup(key) if rid not in self.overlay}
-        found |= {rid for rid, row in self.overlay.items()
-                  if row is not None and _equal(row, key)}
+        found |= {rid for rid, row in self.overlay.items() if row is not None and _equal(row, key)}
         return found
 
-    def select(self, where=None) -> list[Row]:
+    def select(self, where: Where = None) -> list[Row]:
+        """Return copies of the rows matching ``where``.
+
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: the matching rows.
+        """
         return [dict(self.row(rid)) for rid in self.match(where)]
 
     def unique_keys(self) -> list[tuple[str, ...]]:
+        """Return the column tuples of every unique index of the table.
+
+        :return: one tuple of column names per unique index.
+        """
         return self.base.unique_keys()
 
-    def index_on(self, columns):
-        return self.base.index_on(columns)
-
     def new_rowid(self) -> int:
+        """Hand out a new rowid from the table's counter.
+
+        :return: a rowid nobody has ever had.
+        """
         return self.base.new_rowid()
 
     def __len__(self) -> int:
         return sum(1 for _ in self.scan())
 
 
-def _equal(row: Mapping, key: Mapping) -> bool:
-    """SQL equality on every column of `key`: NULL never equals anything."""
+def _equal(row: Mapping[str, Value | None], key: Mapping[str, Value | None]) -> bool:
+    """Compare like SQL on every column of ``key``: NULL never equals anything."""
     return all(v is not None and row[c] == v for c, v in key.items())
 ```
 
@@ -135,9 +191,18 @@ The planners need two new options:
 - **`check=False`** skips the checks that involve *other rows*: uniqueness and foreign keys. Deferred mode (§9.5) runs those at commit instead. Single-row checks (types, NOT NULL, CHECK) always run immediately: there's no reason to defer them, because no later statement can fix them.
 
 ```python
-# minidb/changes.py (replace plan_insert)
-def plan_insert(state, table: str, values: Mapping[str, object], *,
-                check: bool = True) -> list[Change]:
+# src/minidb/changes.py (replace plan_insert)
+def plan_insert(state: State, table: str, values: Mapping[str, object], *, check: bool = True) -> list[Change]:
+    """Plan inserting one row.
+
+    :param state: where to read the current data.
+    :param table: the table's name.
+    :param values: the new row's values, by column name.
+    :param check: whether to check uniqueness and references now;
+        ``True`` by default. Single-row constraints are always checked.
+    :return: the single insert change, with a newly allocated rowid.
+    :raises ConstraintError: if the row breaks a constraint.
+    """
     t = state.table(table)
     row = t.schema.prepare_row(values)
     if check:
@@ -147,9 +212,29 @@ def plan_insert(state, table: str, values: Mapping[str, object], *,
 ```
 
 ```python
-# minidb/changes.py (replace plan_update)
-def plan_update(state, table: str, changes: Mapping[str, object], where=None, *,
-                rowids: Iterable[int] | None = None, check: bool = True) -> list[Change]:
+# src/minidb/changes.py (replace plan_update)
+def plan_update(
+    state: State,
+    table: str,
+    changes: Mapping[str, object],
+    where: Where = None,
+    *,
+    rowids: Iterable[int] | None = None,
+    check: bool = True,
+) -> list[Change]:
+    """Plan setting ``changes`` on some rows.
+
+    :param state: where to read the current data.
+    :param table: the table's name.
+    :param changes: the new values, by column name.
+    :param where: which rows change; ``None`` (the default) for all.
+    :param rowids: the exact rows to change, instead of ``where``; ``None``
+        (the default) to use ``where``.
+    :param check: whether to check uniqueness and references now;
+        ``True`` by default.
+    :return: one update change per row.
+    :raises ConstraintError: if a new row breaks a constraint.
+    """
     t = state.table(table)
     targets = t.match(where) if rowids is None else rowids
     old = {rid: t.row(rid) for rid in targets}
@@ -162,42 +247,68 @@ def plan_update(state, table: str, changes: Mapping[str, object], where=None, *,
 ```
 
 ```python
-# minidb/changes.py (replace plan_delete)
-def plan_delete(state, table: str, where=None, *,
-                rowids: Iterable[int] | None = None, check: bool = True) -> list[Change]:
-    """A delete and everything it implies (cascades, SET NULL), or raise."""
+# src/minidb/changes.py (replace plan_delete)
+def plan_delete(
+    state: State, table: str, where: Where = None, *, rowids: Iterable[int] | None = None, check: bool = True
+) -> list[Change]:
+    """Plan a delete and everything it implies: cascades and SET NULL updates.
+
+    :param state: where to read the current data.
+    :param table: the table's name.
+    :param where: which rows go; ``None`` (the default) for all.
+    :param rowids: the exact rows to delete, instead of ``where``; ``None``
+        (the default) to use ``where``.
+    :param check: whether to refuse ``restrict``-ed deletes now; ``True``
+        by default. Cascades and SET NULL are actions, so they always run.
+    :return: the delete changes, followed by any SET NULL updates.
+    :raises ForeignKeyError: if ``check`` and a ``restrict`` reference
+        forbids the delete.
+    """
     t = state.table(table)
-    targets = t.match(where) if rowids is None else rowids
-    deleted: dict[tuple[str, int], Row] = {}
-    stack = [(table, rid) for rid in targets]
-    while stack:
-        name, rid = stack.pop()
-        if (name, rid) in deleted:
-            continue
-        row = deleted[(name, rid)] = state.table(name).row(rid)
+    deleted = _cascade(state, table, t.match(where) if rowids is None else rowids)
+    nulled = _nulled_children(state, deleted, check=check)
+    return [Change(n, rid, row, None) for (n, rid), row in deleted.items()] + [
+        Change(n, rid, b, a) for (n, rid), (b, a) in nulled.items()
+    ]
+```
+
+```python
+# src/minidb/changes.py (replace _nulled_children)
+def _nulled_children(state: State, deleted: dict[RowRef, Row], *, check: bool) -> dict[RowRef, tuple[Row, Row]]:
+    """Restrict or null every child that survives the cascade."""
+    nulled: dict[RowRef, tuple[Row, Row]] = {}
+    for (name, _), row in deleted.items():
         for fk in references_to(state, name):
-            if fk.on_delete == "cascade":
-                stack.extend((fk.table, c) for c in children(state, fk, row))
-    nulled: dict[tuple[str, int], tuple[Row, Row]] = {}
-    for (name, rid), row in deleted.items():
-        for fk in references_to(state, name):
-            child = state.table(fk.table)
-            survivors = [c for c in children(state, fk, row)
-                         if (fk.table, c) not in deleted]
-            if not survivors:
-                continue
-            if fk.on_delete == "restrict" and check:
-                raise ForeignKeyViolation(
-                    f"{fk.name}: {name} row {fk.child_key(row)} is still "
-                    f"referenced by {len(survivors)} {fk.table} row(s)")
-            if fk.on_delete == "set null":
-                for c in survivors:
-                    before = child.row(c)
-                    base = nulled.get((fk.table, c), (before, before))[1]
-                    after = child.schema.prepare_row(dict.fromkeys(fk.columns), base=base)
-                    nulled[(fk.table, c)] = (before, after)
-    return ([Change(n, rid, row, None) for (n, rid), row in deleted.items()] +
-            [Change(n, rid, b, a) for (n, rid), (b, a) in nulled.items()])
+            survivors = [c for c in children(state, fk, row) if (fk.table, c) not in deleted]
+            if survivors:
+                _restrict_or_null(state, fk, row, survivors, nulled, check=check)
+    return nulled
+```
+
+```python
+# src/minidb/changes.py (replace _restrict_or_null)
+def _restrict_or_null(
+    state: State,
+    fk: ForeignKey,
+    parent_row: Row,
+    survivors: list[int],
+    nulled: dict[RowRef, tuple[Row, Row]],
+    *,
+    check: bool,
+) -> None:
+    if fk.on_delete == "restrict":
+        if check:
+            raise ForeignKeyError(
+                f"{fk.name}: {fk.ref_table} row {fk.child_key(parent_row)} is still "
+                f"referenced by {len(survivors)} {fk.table} row(s)"
+            )
+        return
+    if fk.on_delete == "set null":
+        child = state.table(fk.table)
+        for c in survivors:
+            before = child.row(c)
+            base = nulled.get((fk.table, c), (before, before))[1]
+            nulled[fk.table, c] = (before, child.schema.prepare_row(dict.fromkeys(fk.columns), base=base))
 ```
 
 Cascades and SET NULL are *actions*, not checks, so they run even when `check=False`. Only the `RESTRICT` refusal is deferred.
@@ -205,43 +316,60 @@ Cascades and SET NULL are *actions*, not checks, so they run even when `check=Fa
 Two more functions compute a transaction's **net changes** and run the deferred checks over them:
 
 ```python
-# minidb/changes.py (append)
+# src/minidb/changes.py (append)
 def net_changes(changes: Iterable[Change]) -> list[Change]:
-    """Collapse a sequence of changes to one per row: first before, last after."""
-    net: dict[tuple[str, int], Change] = {}
+    """Collapse a sequence of changes to one per row: its first before, its last after.
+
+    A row inserted and then deleted becomes "nothing happened", and is dropped.
+
+    >>> net_changes([Change("t", 1, None, {"n": 1}), Change("t", 1, {"n": 1}, {"n": 2})])
+    [Change(table='t', rowid=1, before=None, after={'n': 2})]
+
+    :param changes: the changes, in the order they were made.
+    :return: the net changes, in order of each row's first change.
+    """
+    net: dict[RowRef, Change] = {}
     for c in changes:
         key = (c.table, c.rowid)
-        if key in net:
-            net[key] = Change(c.table, c.rowid, net[key].before, c.after)
-        else:
-            net[key] = c
+        net[key] = Change(c.table, c.rowid, net[key].before, c.after) if key in net else c
     return [c for c in net.values() if c.before is not None or c.after is not None]
 
 
-def check_deferred(state, changes: Iterable[Change]) -> None:
-    """Multi-row constraints over a transaction's net effect, in its final state."""
+def check_deferred(state: State, changes: Iterable[Change]) -> None:
+    """Check multi-row constraints over a transaction's net effect, in its final state.
+
+    :param state: the transaction's view, which already includes ``changes``.
+    :param changes: everything the transaction did.
+    :raises UniqueError: if two rows share a unique key.
+    :raises ForeignKeyError: if a reference points at nothing.
+    """
     by_table: dict[str, list[Change]] = {}
     for c in net_changes(changes):
         by_table.setdefault(c.table, []).append(c)
     for name, cs in by_table.items():
         t = state.table(name)
         written = [(c.rowid, c.after) for c in cs if c.after is not None]
-        check_unique(t, written)
+        check_unique(t, [(rid, row) for rid, row in written])
         check_parents_exist(state, t, [row for _, row in written])
         for c in cs:
             if c.before is not None:
                 check_not_dangling(state, t, c.before)
 
 
-def check_not_dangling(state, parent, old_row: Row) -> None:
-    """If `old_row`'s key is gone, nothing may still reference it."""
+def check_not_dangling(state: State, parent: TableLike, old_row: Row) -> None:
+    """Check that, if ``old_row``'s key is gone, nothing still references it.
+
+    :param state: the transaction's view.
+    :param parent: the table ``old_row`` was in.
+    :param old_row: a row that was deleted, or whose key may have changed.
+    :raises ForeignKeyError: if children still reference the vanished key.
+    """
     for fk in references_to(state, parent.name):
         key = {r: old_row[r] for r in fk.ref_columns}
         if any(v is None for v in key.values()) or parent.lookup(key):
-            continue                          # NULL key, or a row still has it
+            continue  # NULL key, or a row still has it
         if children(state, fk, old_row):
-            raise ForeignKeyViolation(
-                f"{fk.name}: {parent.name} row {key} is gone but still referenced")
+            raise ForeignKeyError(f"{fk.name}: {parent.name} row {key} is gone but still referenced")
 ```
 
 `net_changes` is subtle in one case. A row inserted and then deleted in the same transaction becomes `Change(before=None, after=None)`, which means "nothing happened", and is dropped.
@@ -253,22 +381,42 @@ def check_not_dangling(state, parent, old_row: Row) -> None:
 The Unit of Work is itself a **state** in the planner's sense: it has `table(name)`, which returns a lazily created `TableView`, and `foreign_keys`. Each write plans against `self` and records the resulting changes into the views:
 
 ```python
-# minidb/uow.py (append)
-class Record(dict):
-    """A row loaded through a unit of work. Mutate it; commit saves it."""
+# src/minidb/uow.py (append)
+class Record(dict[str, "Value | None"]):
+    """Hold a row loaded through a unit of work; mutate it, and commit saves it.
 
-    def __init__(self, table: str, rowid: int, row: Row):
+    :param table: the table the row is in.
+    :param rowid: the row's rowid.
+    :param row: its current values.
+    """
+
+    def __init__(self, table: str, rowid: int, row: Row) -> None:
         super().__init__(row)
         self.table, self.rowid = table, rowid
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"Record({self.table}#{self.rowid}, {dict.__repr__(self)})"
 
 
-class UnitOfWork:
-    """Version 2: plan into a private workspace; apply net changes on commit."""
+_MISSING = object()
 
-    def __init__(self, db, *, deferred: bool = False):
+
+class UnitOfWork:
+    """Plan writes into a private workspace, and apply their net effect on commit.
+
+    The unit of work is itself a :class:`~minidb.changes.State` and a
+    :class:`~minidb.query.QueryState`: planners and queries read through it
+    and see the transaction's own changes. Rows loaded with :meth:`get` or
+    :meth:`find` are tracked in an identity map, and modifying one is
+    noticed and saved (dirty checking).
+
+    :param db: the database to write to.
+    :param deferred: whether to check uniqueness and references once, at
+        commit, over the final state, instead of after every operation;
+        ``False`` by default.
+    """
+
+    def __init__(self, db: Database, *, deferred: bool = False) -> None:
         self.db = db
         self.deferred = deferred
         self.state = "active"
@@ -279,10 +427,17 @@ class UnitOfWork:
 
     # -- the planner "state" interface ---------------------------------------------------
     @property
-    def foreign_keys(self):
+    def foreign_keys(self) -> Sequence[ForeignKey]:
+        """Return the database's foreign keys."""
         return self.db.foreign_keys
 
     def table(self, name: str) -> TableView:
+        """Return this transaction's view of the table called ``name``.
+
+        :param name: the table's name.
+        :return: the view, created on first use.
+        :raises SchemaError: if there is no such table.
+        """
         view = self._views.get(name)
         if view is None:
             view = self._views[name] = TableView(self.db.table(name))
@@ -290,20 +445,45 @@ class UnitOfWork:
 
     # -- writes: plan now, against the workspace -------------------------------------------
     def insert(self, table: str, values: Mapping[str, object]) -> int:
+        """Insert a row into the workspace.
+
+        :param table: the table's name.
+        :param values: the new row's values, by column name.
+        :return: the new rowid.
+        :raises ConstraintError: if the row breaks a constraint.
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self.flush()
         changes = ch.plan_insert(self, table, values, check=not self.deferred)
         self._record(changes)
         return changes[0].rowid
 
-    def update(self, table: str, changes: Mapping[str, object], where=None) -> int:
+    def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
+        """Update rows in the workspace.
+
+        :param table: the table's name.
+        :param changes: the new values, by column name.
+        :param where: which rows change; ``None`` (the default) for all.
+        :return: the number of rows changed.
+        :raises ConstraintError: if a new row breaks a constraint.
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self.flush()
         planned = ch.plan_update(self, table, changes, where, check=not self.deferred)
         self._record(planned)
         return len(planned)
 
-    def delete(self, table: str, where=None) -> int:
+    def delete(self, table: str, where: Where = None) -> int:
+        """Delete rows, and their cascades, from the workspace.
+
+        :param table: the table's name.
+        :param where: which rows go; ``None`` (the default) for all.
+        :return: the number of rows deleted from ``table`` itself.
+        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self.flush()
         planned = ch.plan_delete(self, table, where, check=not self.deferred)
@@ -311,22 +491,32 @@ class UnitOfWork:
         return sum(1 for c in planned if c.table == table and c.kind == "delete")
 
     def _record(self, changes: list[Change]) -> None:
+        """Put planned changes into the overlays, and keep loaded records current."""
         for c in changes:
             self.table(c.table).overlay[c.rowid] = c.after
             self._changes.append(c)
             key = (c.table, c.rowid)
-            if key in self._identity:                   # keep loaded records current
-                if c.after is None:
-                    del self._identity[key], self._snapshots[key]
-                else:
-                    record = self._identity[key]
-                    record.clear()
-                    record.update(c.after)
-                    self._snapshots[key] = dict(c.after)
+            if key in self._identity:
+                self._refresh(key, c.after)
+
+    def _refresh(self, key: tuple[str, int], after: Row | None) -> None:
+        if after is None:
+            del self._identity[key], self._snapshots[key]
+            return
+        record = self._identity[key]
+        record.clear()
+        record.update(after)
+        self._snapshots[key] = dict(after)
 
     # -- reads -------------------------------------------------------------------------
     def get(self, table: str, rowid: int) -> Record | None:
-        """The row as a tracked Record. Same rowid -> same object."""
+        """Return the row as a tracked :class:`Record`; one object per row.
+
+        :param table: the table's name.
+        :param rowid: the row to load.
+        :return: the record, or ``None`` if the row doesn't exist here.
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         key = (table, rowid)
         if key in self._identity:
@@ -338,31 +528,57 @@ class UnitOfWork:
         self._snapshots[key] = dict(row)
         return record
 
-    def find(self, table: str, where=None) -> list[Record]:
-        self.flush()
-        return [self.get(table, rid) for rid in self.table(table).match(where)]
+    def find(self, table: str, where: Where = None) -> list[Record]:
+        """Return the matching rows as tracked records.
 
-    def select(self, table: str, where=None) -> list[Row]:
+        :param table: the table's name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: one record per matching row.
+        """
+        self.flush()
+        records = [self.get(table, rid) for rid in self.table(table).match(where)]
+        return [r for r in records if r is not None]
+
+    def select(self, table: str, where: Where = None) -> list[Row]:
+        """Return copies of the matching rows, as this transaction sees them.
+
+        :param table: the table's name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: the matching rows.
+        """
         self.flush()
         return self.table(table).select(where)
 
     def query(self, table: str, alias: str | None = None) -> Query:
+        """Start a query that sees this transaction's changes.
+
+        :param table: the first table.
+        :param alias: its alias; ``None`` (the default) uses its name.
+        :return: a query to extend and run.
+        """
         self.flush()
         return Query(self, table, alias)
 
     # -- dirty checking ---------------------------------------------------------------------
     def flush(self) -> None:
-        """Turn modifications of loaded Records into planned updates."""
+        """Turn modifications of loaded records into planned updates.
+
+        :raises ConstraintError: if a modified record breaks a constraint.
+        """
         for key, record in list(self._identity.items()):
             before = self._snapshots[key]
             if record != before:
                 diff = {c: v for c, v in record.items() if before.get(c, _MISSING) != v}
-                planned = ch.plan_update(self, key[0], diff, rowids=[key[1]],
-                                         check=not self.deferred)
-                self._record(planned)
+                self._record(ch.plan_update(self, key[0], diff, rowids=[key[1]], check=not self.deferred))
 
     # -- finishing ---------------------------------------------------------------------
     def commit(self) -> None:
+        """Flush, run the deferred checks if any, and apply the net changes.
+
+        :raises ConstraintError: if a deferred check fails; the unit of
+            work then stays active.
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self.flush()
         if self.deferred:
@@ -371,6 +587,10 @@ class UnitOfWork:
         self.state = "committed"
 
     def rollback(self) -> None:
+        """Forget every change: the shared tables were never touched.
+
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self._views.clear()
         self._changes.clear()
@@ -381,10 +601,12 @@ class UnitOfWork:
         if self.state != "active":
             raise TransactionError(f"unit of work is already {self.state}")
 
-    def __enter__(self) -> "UnitOfWork":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
         if self.state != "active":
             return
         if exc_type is not None:
@@ -393,11 +615,8 @@ class UnitOfWork:
         try:
             self.commit()
         except BaseException:
-            self.rollback()                     # a failed commit must not stay open
+            self.rollback()  # a failed commit must not stay open
             raise
-
-
-_MISSING = object()
 ```
 
 Let's walk through the important decisions.
@@ -417,38 +636,102 @@ Let's walk through the important decisions.
 Finally, `Database` routes its own writes through a one-statement Unit of Work. Now there is exactly **one write path** into the tables: `UnitOfWork.commit` → `Database.apply`.
 
 ```python
-# minidb/database.py (replace Database.insert)
-    def insert(self, table: str, values: Row) -> int:
+# src/minidb/database.py (replace Database.insert)
+    def insert(self, table: str, values: Mapping[str, object]) -> int:
+        """Insert a row, in a transaction of its own.
+
+        :param table: the table's name.
+        :param values: the new row's values, by column name.
+        :return: the new rowid.
+        :raises ConstraintError: if the row breaks a constraint.
+        """
         with self.unit_of_work() as uow:
             return uow.insert(table, values)
 ```
 
 ```python
-# minidb/database.py (replace Database.update)
-    def update(self, table: str, changes: Row, where: Where = None) -> int:
+# src/minidb/database.py (replace Database.update)
+    def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
+        """Update rows, in a transaction of its own.
+
+        :param table: the table's name.
+        :param changes: the new values, by column name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
+        :return: the number of rows changed.
+        :raises ConstraintError: if a new row breaks a constraint.
+        """
         with self.unit_of_work() as uow:
             return uow.update(table, changes, where)
 ```
 
 ```python
-# minidb/database.py (replace Database.delete)
+# src/minidb/database.py (replace Database.delete)
     def delete(self, table: str, where: Where = None) -> int:
+        """Delete rows and their cascades, in a transaction of its own.
+
+        :param table: the table's name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
+        :return: the number of rows deleted from ``table`` itself.
+        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
+        """
         with self.unit_of_work() as uow:
             return uow.delete(table, where)
 ```
 
 ```python
-# minidb/database.py (replace Database.unit_of_work)
+# src/minidb/database.py (replace Database.unit_of_work)
     def unit_of_work(self, *, deferred: bool = False) -> UnitOfWork:
+        """Start a transaction; see :class:`UnitOfWork`.
+
+        :param deferred: whether to check multi-row constraints only at
+            commit; ``False`` by default.
+        :return: a new, active unit of work.
+        """
         return UnitOfWork(self, deferred=deferred)
 ```
 
 A `return` inside `with` leaves the block normally, so `__exit__` commits. The returned value is computed before the commit, but the function only returns after it.
 
 ```python
-# minidb/__init__.py (append)
+# src/minidb/__init__.py (replace __all__)
+__all__ = [
+    "Avg",
+    "Boolean",
+    "Change",
+    "Check",
+    "CheckError",
+    "Column",
+    "ConstraintError",
+    "Count",
+    "Database",
+    "DatabaseError",
+    "Date",
+    "DomainError",
+    "ForeignKey",
+    "ForeignKeyError",
+    "Integer",
+    "Max",
+    "Min",
+    "NotNullError",
+    "Numeric",
+    "Query",
+    "Real",
+    "Record",
+    "SchemaError",
+    "Sum",
+    "TableSchema",
+    "Text",
+    "Timestamp",
+    "TransactionError",
+    "UniqueError",
+    "UnitOfWork",
+    "normalizers",
+]
+```
+
+```python
+# src/minidb/__init__.py (imports)
 from minidb.uow import Record
-__all__ += ["Record"]
 ```
 
 ## 9.4 Trying it out
@@ -471,7 +754,7 @@ Read your own writes, and errors reported at the line that caused them:
 >>> uow.insert("users", {"id": 1, "name": "Ada again"})
 Traceback (most recent call last):
   ...
-minidb.errors.UniqueViolation: users: duplicate key (id=1)
+minidb.errors.UniqueError: users: duplicate key (id=1)
 >>> uow.commit()                                                 # the failed insert left no trace
 >>> [r["name"] for r in db.query("users")]
 ['Ada', 'Alan']
@@ -529,7 +812,7 @@ Some valid end states can't be reached one valid statement at a time. Here are t
 >>> db.insert("employees", {"id": 1, "buddy": 2})
 Traceback (most recent call last):
   ...
-minidb.errors.ForeignKeyViolation: fk_employees_buddy: no employees row with {'id': 2}
+minidb.errors.ForeignKeyError: fk_employees_buddy: no employees row with {'id': 2}
 >>> with db.unit_of_work(deferred=True) as uow:
 ...     _ = uow.insert("employees", {"id": 1, "buddy": 2})
 ...     _ = uow.insert("employees", {"id": 2, "buddy": 1})
@@ -544,7 +827,7 @@ And a deferred transaction whose *end state* is invalid fails at commit, leaving
 ...     _ = uow.delete("employees", {"id": 1})       # 2 still names 1 as buddy
 Traceback (most recent call last):
   ...
-minidb.errors.ForeignKeyViolation: fk_employees_buddy: employees row {'id': 1} is gone but still referenced
+minidb.errors.ForeignKeyError: fk_employees_buddy: employees row {'id': 1} is gone but still referenced
 >>> len(db.select("employees"))
 2
 ```
@@ -575,6 +858,8 @@ We have atomic, consistent transactions with a pleasant API: **A** and **C** of 
 6. Make deferral per constraint: `ForeignKey(..., deferrable=True)`, `TableSchema(unique_deferrable=...)`. Non-deferrable constraints are checked while planning even in a deferred transaction.
 7. `flush()` diffs each record against a snapshot: O(columns) per loaded record per flush. With 10,000 loaded records and a flush before every query, that adds up. Sketch an alternative where `Record.__setitem__` marks the record dirty. What can that approach miss? (Hint: mutable values; recall [Exercise 3.4](03-types-and-normalization.md#questions-and-exercises).)
 8. *(Research)* SQLAlchemy's `Session` implements both the identity map and the Unit of Work. Read the "Unit of Work" section of its documentation and list two features it has that ours lacks.
+
+*Answers: [Appendix D, Chapter 9](appendix-d-answers.md#chapter-9--the-unit-of-work-version-2).*
 
 ---
 

@@ -17,7 +17,7 @@ This book builds **minidb**, a small but real relational database, one subsystem
 - **durability** through a write-ahead log and atomic snapshots, with **pluggable file formats** (JSON first);
 - and, in an appendix, a **SQL front end**.
 
-Every code listing was assembled into a working package chapter by chapter, and every interactive example was run against it, on both the regular and the free-threaded (`python3.14t`) builds of Python 3.14.
+Every code listing was assembled into a working package chapter by chapter, and every interactive example was run against it, on both the regular and the free-threaded (`python3.14t`) builds of Python 3.14. The code is formatted and linted with **ruff** (every rule enabled) and type-checked with **pyrefly** in strict mode; it uses generics (PEP 695 syntax) and protocols throughout, and every module, class and function has a reStructuredText docstring, with doctests that are run too.
 
 ### Who it's for
 
@@ -25,7 +25,7 @@ You should be comfortable with Python: classes, dataclasses, generators, context
 
 ### How to read it
 
-Read the chapters in order: each builds on the previous one's code. [Chapter 1](01-relational-model.md#14-how-to-read-the-code-in-this-book) explains the conventions for code listings. Each chapter ends with **questions and exercises**. Some check understanding, some extend minidb, and a few point to research papers. Diagrams are drawn with Mermaid (rendered by GitHub, GitLab, VS Code and most Markdown viewers) or included as SVG images.
+Read the chapters in order: each builds on the previous one's code. [Chapter 1](01-relational-model.md#14-how-to-read-the-code-in-this-book) explains the conventions for code listings. Each chapter ends with **questions and exercises**. Some check understanding, some extend minidb, and a few point to research papers. [Appendix D](appendix-d-answers.md) answers all of them, with code that was checked the same way as the chapters'. Diagrams are drawn with Mermaid (rendered by GitHub, GitLab, VS Code and most Markdown viewers) or included as SVG images.
 
 ```mermaid
 flowchart LR
@@ -38,6 +38,8 @@ flowchart LR
     C12 --> C14
     C14 --> C15[15 B-trees]
     C14 --> A[A SQL front end]
+    C13 --> B[B Testing]
+    A --> B
 ```
 
 ## Contents
@@ -45,18 +47,18 @@ flowchart LR
 ### Part I — Foundations
 
 - **[Chapter 1 — What a Relational Database Is](01-relational-model.md)**
-  <br/>[The relational model in one page](01-relational-model.md#11-the-relational-model-in-one-page) · [A database in 30 lines](01-relational-model.md#12-a-database-in-30-lines) · [The architecture we are heading for](01-relational-model.md#13-the-architecture-we-are-heading-for) · [How to read the code in this book](01-relational-model.md#14-how-to-read-the-code-in-this-book) · [Further reading](01-relational-model.md#15-further-reading)
+  <br/>[The relational model in one page](01-relational-model.md#11-the-relational-model-in-one-page) · [A database in forty lines](01-relational-model.md#12-a-database-in-forty-lines) · [The architecture we are heading for](01-relational-model.md#13-the-architecture-we-are-heading-for) · [How to read the code in this book](01-relational-model.md#14-how-to-read-the-code-in-this-book) · [Further reading](01-relational-model.md#15-further-reading)
 - **[Chapter 2 — Tables and CRUD, Version 1](02-tables-and-crud.md)**
-  <br/>[Errors first](02-tables-and-crud.md#21-errors-first) · [Rows and rowids](02-tables-and-crud.md#22-rows-and-rowids) · [The Table class](02-tables-and-crud.md#23-the-table-class) · [The Database façade](02-tables-and-crud.md#24-the-database-façade) · [Taking it for a spin](02-tables-and-crud.md#25-taking-it-for-a-spin) · [What we have, and what's missing](02-tables-and-crud.md#26-what-we-have-and-whats-missing)
+  <br/>[Errors first](02-tables-and-crud.md#21-errors-first) · [Rows and rowids](02-tables-and-crud.md#22-rows-and-rowids) · [The `Table` class](02-tables-and-crud.md#23-the-table-class) · [The `Database` façade](02-tables-and-crud.md#24-the-database-façade) · [Taking it for a spin](02-tables-and-crud.md#25-taking-it-for-a-spin) · [What we have, and what's missing](02-tables-and-crud.md#26-what-we-have-and-whats-missing)
 - **[Chapter 3 — Types and Normalization](03-types-and-normalization.md)**
-  <br/>[Domain errors](03-types-and-normalization.md#31-domain-errors) · [The Type base class](03-types-and-normalization.md#32-the-type-base-class) · [Column normalizers](03-types-and-normalization.md#33-column-normalizers) · [Columns and table schemas](03-types-and-normalization.md#34-columns-and-table-schemas) · [Tables with schemas](03-types-and-normalization.md#35-tables-with-schemas) · [Trying it out](03-types-and-normalization.md#36-trying-it-out) · [Normalization, the *other* meaning](03-types-and-normalization.md#37-normalization-the-other-meaning)
+  <br/>[Domain errors](03-types-and-normalization.md#31-domain-errors) · [The `Type` base class](03-types-and-normalization.md#32-the-type-base-class) · [Column normalizers](03-types-and-normalization.md#33-column-normalizers) · [Columns and table schemas](03-types-and-normalization.md#34-columns-and-table-schemas) · [Tables with schemas](03-types-and-normalization.md#35-tables-with-schemas) · [Trying it out](03-types-and-normalization.md#36-trying-it-out) · [Normalization, the *other* meaning](03-types-and-normalization.md#37-normalization-the-other-meaning)
 
 ### Part II — Integrity
 
 - **[Chapter 4 — Constraints I: NULL, Defaults and Checks](04-constraints.md)**
   <br/>[The constraint pipeline](04-constraints.md#41-the-constraint-pipeline) · [Three-valued logic](04-constraints.md#42-three-valued-logic) · [Columns with constraints](04-constraints.md#43-columns-with-constraints) · [Trying it out](04-constraints.md#44-trying-it-out) · [What constraints are *for*](04-constraints.md#45-what-constraints-are-for)
 - **[Chapter 5 — Keys and Indexes](05-keys-and-indexes.md)**
-  <br/>[Keys](05-keys-and-indexes.md#51-keys) · [A hash index](05-keys-and-indexes.md#52-a-hash-index) · [Declaring keys in the schema](05-keys-and-indexes.md#53-declaring-keys-in-the-schema) · [Table, rewritten around put and remove](05-keys-and-indexes.md#54-table-rewritten-around-put-and-remove) · [Database changes](05-keys-and-indexes.md#55-database-changes) · [Trying it out](05-keys-and-indexes.md#56-trying-it-out) · [How much faster?](05-keys-and-indexes.md#57-how-much-faster) · [What hash indexes can't do](05-keys-and-indexes.md#58-what-hash-indexes-cant-do)
+  <br/>[Keys](05-keys-and-indexes.md#51-keys) · [A hash index](05-keys-and-indexes.md#52-a-hash-index) · [Declaring keys in the schema](05-keys-and-indexes.md#53-declaring-keys-in-the-schema) · [`Table`, rewritten around `put` and `remove`](05-keys-and-indexes.md#54-table-rewritten-around-put-and-remove) · [Database changes](05-keys-and-indexes.md#55-database-changes) · [Trying it out](05-keys-and-indexes.md#56-trying-it-out) · [How much faster?](05-keys-and-indexes.md#57-how-much-faster) · [What hash indexes can't do](05-keys-and-indexes.md#58-what-hash-indexes-cant-do)
 - **[Chapter 6 — Referential Integrity](06-referential-integrity.md)**
   <br/>[Where foreign keys live](06-referential-integrity.md#61-where-foreign-keys-live) · [Checking in both directions needs indexes](06-referential-integrity.md#62-checking-in-both-directions-needs-indexes) · [The database orchestrates](06-referential-integrity.md#63-the-database-orchestrates) · [Trying it out](06-referential-integrity.md#64-trying-it-out) · [The limits of statement-at-a-time](06-referential-integrity.md#65-the-limits-of-statement-at-a-time)
 
@@ -68,13 +70,13 @@ flowchart LR
 ### Part IV — Transactions and Concurrency
 
 - **[Chapter 8 — Unit of Work I: Changes, Commit and Undo](08-unit-of-work-i.md)**
-  <br/>[Changes: writes as data](08-unit-of-work-i.md#81-changes-writes-as-data) · [The planning module](08-unit-of-work-i.md#82-the-planning-module) · [A slimmer Table](08-unit-of-work-i.md#83-a-slimmer-table) · [Database: plan, then apply](08-unit-of-work-i.md#84-database-plan-then-apply) · [The Unit of Work, version 1](08-unit-of-work-i.md#85-the-unit-of-work-version-1) · [Trying it out](08-unit-of-work-i.md#86-trying-it-out) · [What's wrong with version 1](08-unit-of-work-i.md#87-whats-wrong-with-version-1)
+  <br/>[Changes: writes as data](08-unit-of-work-i.md#81-changes-writes-as-data) · [The planning module](08-unit-of-work-i.md#82-the-planning-module) · [A slimmer `Table`](08-unit-of-work-i.md#83-a-slimmer-table) · [`Database`: plan, then apply](08-unit-of-work-i.md#84-database-plan-then-apply) · [The Unit of Work, version 1](08-unit-of-work-i.md#85-the-unit-of-work-version-1) · [Trying it out](08-unit-of-work-i.md#86-trying-it-out) · [What's wrong with version 1](08-unit-of-work-i.md#87-whats-wrong-with-version-1)
 - **[Chapter 9 — Unit of Work II: Workspaces, Identity Map and Deferred Constraints](09-unit-of-work-ii.md)**
   <br/>[The table view](09-unit-of-work-ii.md#91-the-table-view) · [Planners with options](09-unit-of-work-ii.md#92-planners-with-options) · [The Unit of Work, version 2](09-unit-of-work-ii.md#93-the-unit-of-work-version-2) · [Trying it out](09-unit-of-work-ii.md#94-trying-it-out) · [Deferred constraints](09-unit-of-work-ii.md#95-deferred-constraints) · [Where we are](09-unit-of-work-ii.md#96-where-we-are)
 - **[Chapter 10 — Concurrency I: Threads and One Big Lock](10-concurrency-i.md)**
   <br/>[Python threads in 2026](10-concurrency-i.md#101-python-threads-in-2026) · [Breaking minidb](10-concurrency-i.md#102-breaking-minidb) · [Two kinds of protection](10-concurrency-i.md#103-two-kinds-of-protection) · [One big lock](10-concurrency-i.md#104-one-big-lock) · [Checking the fix](10-concurrency-i.md#105-checking-the-fix) · [The price of one big lock](10-concurrency-i.md#106-the-price-of-one-big-lock)
 - **[Chapter 11 — Readers–Writer Locks and Starvation](11-readers-writer-locks.md)**
-  <br/>[Building blocks: monitors and condition variables](11-readers-writer-locks.md#111-building-blocks-monitors-and-condition-variables) · [The interface](11-readers-writer-locks.md#112-the-interface) · [Attempt 1: readers first](11-readers-writer-locks.md#113-attempt-1-readers-first) · [Attempt 2: writers first](11-readers-writer-locks.md#114-attempt-2-writers-first) · [The fix: one queue, served in order](11-readers-writer-locks.md#115-the-fix-one-queue-served-in-order) · [Watching starvation happen](11-readers-writer-locks.md#116-watching-starvation-happen) · [Plugging it into minidb](11-readers-writer-locks.md#117-plugging-it-into-minidb) · [Trying it out](11-readers-writer-locks.md#118-trying-it-out) · [What's left](11-readers-writer-locks.md#119-whats-left)
+  <br/>[Building blocks: monitors and condition variables](11-readers-writer-locks.md#111-building-blocks-monitors-and-condition-variables) · [The interface](11-readers-writer-locks.md#112-the-interface) · [Attempt 1: readers first](11-readers-writer-locks.md#113-attempt-1-readers-first) · [Attempt 2: writers first](11-readers-writer-locks.md#114-attempt-2-writers-first) · [The fix: one queue, served in order](11-readers-writer-locks.md#115-the-fix-one-queue-served-in-order) · [Watching starvation happen](11-readers-writer-locks.md#116-watching-starvation-happen) · [Plugging it into minidb](11-readers-writer-locks.md#117-plugging-it-into-minidb)
 - **[Chapter 12 — Isolation: Optimistic Concurrency Control](12-isolation.md)**
   <br/>[What can go wrong: isolation anomalies](12-isolation.md#121-what-can-go-wrong-isolation-anomalies) · [The plan: read set, validation, write](12-isolation.md#122-the-plan-read-set-validation-write) · [Code](12-isolation.md#123-code) · [Trying it out](12-isolation.md#124-trying-it-out) · [Isolation in real systems](12-isolation.md#125-isolation-in-real-systems) · [Fairness has a price](12-isolation.md#126-fairness-has-a-price)
 
@@ -94,6 +96,8 @@ flowchart LR
 - **[Appendix B — Testing a Database](appendix-b-testing.md)**
   <br/>[An integrity checker](appendix-b-testing.md#b1-an-integrity-checker) · [Property-based and model-based tests](appendix-b-testing.md#b2-property-based-and-model-based-tests) · [Concurrency tests](appendix-b-testing.md#b3-concurrency-tests) · [Crash tests](appendix-b-testing.md#b4-crash-tests) · [The test module](appendix-b-testing.md#b5-the-test-module)
 - **[Appendix C — The Complete Code](appendix-c-complete-code.md)**
+- **[Appendix D — Answers to the Exercises](appendix-d-answers.md)**
+  <br/>[Chapter 1](appendix-d-answers.md#chapter-1--what-a-relational-database-is) · [Chapter 2](appendix-d-answers.md#chapter-2--tables-and-crud) · [Chapter 3](appendix-d-answers.md#chapter-3--types-and-normalization) · [Chapter 4](appendix-d-answers.md#chapter-4--constraints) · [Chapter 5](appendix-d-answers.md#chapter-5--keys-and-indexes) · [Chapter 6](appendix-d-answers.md#chapter-6--referential-integrity) · [Chapter 7](appendix-d-answers.md#chapter-7--query-primitives) · [Chapter 8](appendix-d-answers.md#chapter-8--the-unit-of-work-version-1) · [Chapter 9](appendix-d-answers.md#chapter-9--the-unit-of-work-version-2) · [Chapter 10](appendix-d-answers.md#chapter-10--concurrency-part-i) · [Chapter 11](appendix-d-answers.md#chapter-11--readerswriter-locks) · [Chapter 12](appendix-d-answers.md#chapter-12--isolation) · [Chapter 13](appendix-d-answers.md#chapter-13--persistence) · [Chapter 14](appendix-d-answers.md#chapter-14--query-planning) · [Chapter 15](appendix-d-answers.md#chapter-15--b-trees) · [Appendix A](appendix-d-answers.md#appendix-a--a-sql-parser) · [Appendix B](appendix-d-answers.md#appendix-b--testing-a-database)
 
 ### Back matter
 

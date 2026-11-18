@@ -28,21 +28,21 @@ flowchart TD
     G --> H["row checks"]
     H --> I["prepared row"]
     E -. DomainError .-> R((reject))
-    F -. NotNullViolation .-> R
-    G -. CheckViolation .-> R
-    H -. CheckViolation .-> R
+    F -. NotNullError .-> R
+    G -. CheckError .-> R
+    H -. CheckError .-> R
 ```
 
 Two new errors join the hierarchy:
 
 ```python
-# minidb/errors.py (append)
-class NotNullViolation(ConstraintError):
-    """A NOT NULL column received NULL."""
+# src/minidb/errors.py (append)
+class NotNullError(ConstraintError):
+    """Signal that a NOT NULL column received NULL."""
 
 
-class CheckViolation(ConstraintError):
-    """A CHECK constraint evaluated to false."""
+class CheckError(ConstraintError):
+    """Signal that a CHECK constraint evaluated to false."""
 ```
 
 ## 4.2 Three-valued logic
@@ -71,53 +71,102 @@ In [Chapter 14](14-query-planning.md) we build real expression objects that impl
 `Column` grows three fields. `default` may be a plain value or a zero-argument callable (for things like "now"). A new `Check` class names a row-level rule, so error messages can say *which* rule failed.
 
 ```python
-# minidb/schema.py (replace Column)
-_NO_DEFAULT = object()
-
-
+# src/minidb/schema.py (replace Column)
 @dataclass(frozen=True)
 class Column:
-    name: str
-    type: Type
-    normalizers: tuple[Callable[[object], object], ...] = ()
-    nullable: bool = True
-    default: object = None          # a value, or a zero-argument callable
-    check: Callable[[object], bool | None] | None = None
+    """Declare a column: its name, type, normalizers and single-column constraints.
 
-    def make_default(self):
+    >>> from minidb.types import Integer
+    >>> qty = Column("qty", Integer(), nullable=False, default=0, check=lambda q: q >= 0)
+    >>> qty.make_default(), qty.prepare("5")
+    (0, 5)
+
+    :param name: the column's name.
+    :param type: the column's type.
+    :param normalizers: functions applied to every non-NULL value after the
+        type has normalized it; none by default.
+    :param nullable: whether the column may hold NULL; ``True`` by default.
+    :param default: the value for inserts that omit the column: a value,
+        or a function of no arguments that returns one; ``None`` by default.
+    :param check: a CHECK on non-NULL values, returning ``True``, ``False``
+        or ``None`` (UNKNOWN); ``None`` (the default) for no check.
+    """
+
+    name: str
+    type: Type[Value]
+    normalizers: tuple[Normalizer, ...] = ()
+    nullable: bool = True
+    default: Value | Callable[[], Value | None] | None = None
+    check: Callable[[Value], bool | None] | None = None
+
+    def make_default(self) -> Value | None:
+        """Return the default value, calling the default if it is a function.
+
+        :return: the value an insert should use when it omits this column.
+        """
         return self.default() if callable(self.default) else self.default
 
-    def prepare(self, value):
-        """Normalize, then validate one value. Raises DomainError."""
-        value = self.type.normalize(value)
-        if value is not None:
+    def prepare(self, value: object) -> Value | None:
+        """Normalize, then validate one value for this column.
+
+        :param value: the input value, or ``None``.
+        :return: the value to store.
+        :raises DomainError: if the value doesn't belong to the column's type.
+        """
+        prepared = self.type.normalize(value)
+        if prepared is not None:
             for fn in self.normalizers:
-                value = fn(value)
-        self.type.validate(value)
-        return value
+                prepared = fn(prepared)
+        self.type.validate(prepared)
+        return prepared
 
 
 @dataclass(frozen=True)
 class Check:
-    """A named row-level CHECK. `predicate(row)` returns True, False or None."""
+    """Declare a named row-level CHECK constraint.
+
+    >>> positive = Check("positive", lambda row: row["n"] > 0)
+    >>> positive.predicate({"n": 3})
+    True
+
+    :param name: names the constraint in error messages.
+    :param predicate: a function of the whole row returning ``True``,
+        ``False`` or ``None`` (UNKNOWN); only ``False`` rejects the row.
+    """
+
     name: str
-    predicate: Callable[[Mapping[str, object]], bool | None]
+    predicate: RowCheck
 ```
 
 `TableSchema` gets a `checks` field and a rewritten `prepare_row` that runs the stages in order:
 
 ```python
-# minidb/schema.py (replace TableSchema)
+# src/minidb/schema.py (replace TableSchema)
 @dataclass(frozen=True)
 class TableSchema:
+    """Declare a table and run the constraint pipeline that prepares its rows.
+
+    >>> from minidb.types import Integer
+    >>> schema = TableSchema("t", (Column("n", Integer(), nullable=False, default=1),))
+    >>> schema.prepare_row({})
+    {'n': 1}
+    >>> schema.prepare_row({"n": None})
+    Traceback (most recent call last):
+      ...
+    minidb.errors.NotNullError: t.n may not be NULL
+
+    :param name: the table's name.
+    :param columns: its columns, in order.
+    :param checks: its row-level CHECK constraints; none by default.
+    :raises SchemaError: if two columns share a name.
+    """
+
     name: str
     columns: tuple[Column, ...]
     checks: tuple[Check, ...] = ()
     by_name: Mapping[str, Column] = field(init=False, repr=False, compare=False)
 
-    def __post_init__(self):
-        object.__setattr__(self, "columns", tuple(self.columns))
-        object.__setattr__(self, "checks", tuple(self.checks))
+    def __post_init__(self) -> None:
         names = [c.name for c in self.columns]
         if len(set(names)) != len(names):
             raise SchemaError(f"duplicate column names in {self.name!r}")
@@ -125,33 +174,42 @@ class TableSchema:
 
     @property
     def column_names(self) -> tuple[str, ...]:
+        """Return the column names, in order."""
         return tuple(c.name for c in self.columns)
 
     def column(self, name: str) -> Column:
+        """Return the column called ``name``.
+
+        :param name: the column's name.
+        :return: the column.
+        :raises SchemaError: if there is no such column.
+        """
         try:
             return self.by_name[name]
         except KeyError:
             raise SchemaError(f"{self.name}: no such column {name!r}") from None
 
-    def prepare_row(self, values: Mapping[str, object],
-                    base: Row | None = None) -> Row:
-        """Run the constraint pipeline; return a complete, valid row.
+    def prepare_row(self, values: Mapping[str, object], base: Row | None = None) -> Row:
+        """Run the constraint pipeline and return a complete, valid row.
 
-        `values` are the user's input; `base` is the existing row for an
-        update (None for an insert). Neither argument is modified.
+        The stages run in a fixed order: defaults (for inserts), types,
+        NOT NULL, column checks, row checks. Neither argument is modified.
+
+        :param values: the user's input, by column name.
+        :param base: the existing row, for an update; ``None`` (the default)
+            for an insert.
+        :return: the row to store.
+        :raises SchemaError: if ``values`` names an unknown column.
+        :raises DomainError: if a value doesn't belong to its column's type.
+        :raises NotNullError: if a NOT NULL column would hold NULL.
+        :raises CheckError: if a CHECK constraint is false.
         """
         for name in values:
-            self.column(name)                                # unknown column?
-        if base is None:                                     # insert
-            row = {c.name: values[c.name] if c.name in values else c.make_default()
-                   for c in self.columns}
-            touched = self.column_names
-        else:                                                # update
-            row = dict(base) | dict(values)
-            touched = tuple(values)
-        for name in touched:
+            self.column(name)  # unknown column?
+        row: Row = dict(base) if base is not None else {}
+        for name, value in self._pending(values, base).items():
             try:
-                row[name] = self.by_name[name].prepare(row[name])
+                row[name] = self.by_name[name].prepare(value)
             except DomainError as e:
                 raise DomainError(f"{self.name}.{name}: {e}") from None
         self._check_not_null(row)
@@ -160,28 +218,47 @@ class TableSchema:
         return row
 
     # -- stages ---------------------------------------------------------------
+    def _pending(self, values: Mapping[str, object], base: Row | None) -> dict[str, object]:
+        """Return the raw values that still need preparing, by column.
+
+        An insert prepares every column, using defaults for missing ones; an
+        update prepares only the columns it changes.
+        """
+        if base is not None:
+            return dict(values)
+        return {c.name: values[c.name] if c.name in values else c.make_default() for c in self.columns}
+
     def _check_not_null(self, row: Row) -> None:
         for c in self.columns:
             if not c.nullable and row[c.name] is None:
-                raise NotNullViolation(f"{self.name}.{c.name} may not be NULL")
+                raise NotNullError(f"{self.name}.{c.name} may not be NULL")
 
     def _check_columns(self, row: Row) -> None:
         for c in self.columns:
             value = row[c.name]
             if c.check is not None and value is not None and c.check(value) is False:
-                raise CheckViolation(f"{self.name}.{c.name}: check failed for {value!r}")
+                raise CheckError(f"{self.name}.{c.name}: check failed for {value!r}")
 
     def _check_rows(self, row: Row) -> None:
         view = MappingProxyType(row)
         for check in self.checks:
             if check.predicate(view) is False:
-                raise CheckViolation(f"{self.name}: check {check.name!r} failed")
+                raise CheckError(f"{self.name}: check {check.name!r} failed")
 ```
 
 ```python
-# minidb/schema.py (imports)
+# src/minidb/schema.py (imports)
 from types import MappingProxyType
-from minidb.errors import CheckViolation, NotNullViolation
+
+from minidb.errors import CheckError
+from minidb.errors import NotNullError
+```
+
+The row-level check's type gets a name next to `Normalizer`:
+
+```python
+# src/minidb/schema.py (append)
+type RowCheck = Callable[[Mapping[str, Value | None]], object]
 ```
 
 Some points to notice:
@@ -194,9 +271,23 @@ Some points to notice:
 `create_table` passes the new `checks` argument through:
 
 ```python
-# minidb/database.py (replace Database.create_table)
-    def create_table(self, name: str, columns: list[Column],
-                     checks: list[Check] = ()) -> Table:
+# src/minidb/database.py (replace Database.create_table)
+    def create_table(self, name: str, columns: Sequence[Column], checks: Sequence[Check] = ()) -> Table:
+        """Create an empty table and return it.
+
+        >>> from minidb.schema import Column
+        >>> from minidb.types import Text
+        >>> db = Database()
+        >>> db.create_table("users", [Column("name", Text())]).columns
+        ('name',)
+
+        :param name: the new table's name.
+        :param columns: its columns, in order.
+        :param checks: its row-level CHECK constraints; none by default.
+        :return: the new table.
+        :raises SchemaError: if the table already exists, or two columns
+            share a name.
+        """
         if name in self.tables:
             raise SchemaError(f"table {name!r} already exists")
         schema = TableSchema(name, tuple(columns), tuple(checks))
@@ -205,25 +296,51 @@ Some points to notice:
 ```
 
 ```python
-# minidb/database.py (imports)
+# src/minidb/database.py (typing imports)
 from minidb.schema import Check
 ```
 
 ```python
-# minidb/__init__.py
-"""minidb: a small relational database, built in the book."""
-from minidb.database import Database
-from minidb.errors import (CheckViolation, ConstraintError, DatabaseError,
-                           DomainError, NotNullViolation, SchemaError)
-from minidb.schema import Check, Column, TableSchema
-from minidb.types import Boolean, Date, Integer, Numeric, Real, Text, Timestamp
+# src/minidb/__init__.py
+"""Build a small relational database, one chapter at a time."""
+
 from minidb import normalizers
+from minidb.database import Database
+from minidb.errors import CheckError
+from minidb.errors import ConstraintError
+from minidb.errors import DatabaseError
+from minidb.errors import DomainError
+from minidb.errors import NotNullError
+from minidb.errors import SchemaError
+from minidb.schema import Check
+from minidb.schema import Column
+from minidb.schema import TableSchema
+from minidb.types import Boolean
+from minidb.types import Date
+from minidb.types import Integer
+from minidb.types import Numeric
+from minidb.types import Real
+from minidb.types import Text
+from minidb.types import Timestamp
 
 __all__ = [
-    "Database", "DatabaseError", "SchemaError", "ConstraintError", "DomainError",
-    "NotNullViolation", "CheckViolation",
-    "Column", "Check", "TableSchema",
-    "Integer", "Real", "Text", "Boolean", "Numeric", "Date", "Timestamp",
+    "Boolean",
+    "Check",
+    "CheckError",
+    "Column",
+    "ConstraintError",
+    "Database",
+    "DatabaseError",
+    "Date",
+    "DomainError",
+    "Integer",
+    "NotNullError",
+    "Numeric",
+    "Real",
+    "SchemaError",
+    "TableSchema",
+    "Text",
+    "Timestamp",
     "normalizers",
 ]
 ```
@@ -250,21 +367,21 @@ __all__ = [
 >>> db.insert("products", {"sku": "A-2", "price": 0})
 Traceback (most recent call last):
   ...
-minidb.errors.CheckViolation: products.price: check failed for Decimal('0.00')
+minidb.errors.CheckError: products.price: check failed for Decimal('0.00')
 >>> db.insert("products", {"sku": "A-3", "price": 5, "qty": None})
 Traceback (most recent call last):
   ...
-minidb.errors.NotNullViolation: products.qty may not be NULL
+minidb.errors.NotNullError: products.qty may not be NULL
 >>> db.update("products", {"discount": 20})
 Traceback (most recent call last):
   ...
-minidb.errors.CheckViolation: products: check 'discount_le_price' failed
+minidb.errors.CheckError: products: check 'discount_le_price' failed
 >>> db.update("products", {"discount": "1.50"})
 1
 >>> db.update("products", {"price": 1})       # now the *price* change violates the row check
 Traceback (most recent call last):
   ...
-minidb.errors.CheckViolation: products: check 'discount_le_price' failed
+minidb.errors.CheckError: products: check 'discount_le_price' failed
 ```
 
 The last example shows why every row check runs on every update: the statement didn't mention `discount`, but it broke the rule anyway.
@@ -284,6 +401,8 @@ It's also why constraints must be checked **centrally and unavoidably**. In mini
 5. Should `Column.check` receive the *normalized* or the *raw* value? Find a check that gives a different answer in each case.
 6. SQL supports `DEFAULT CURRENT_TIMESTAMP`. Add it with a callable default. If a single `INSERT` statement inserts 1000 rows, should they all get the same timestamp? What does your implementation do? (PostgreSQL's `now()` returns the *transaction's* start time. Why might that be preferable?)
 7. *(Design)* Some databases let you mark constraints `NOT VALID` or disable them temporarily for bulk loads. What would minidb have to do when such a constraint is re-enabled?
+
+*Answers: [Appendix D, Chapter 4](appendix-d-answers.md#chapter-4--constraints).*
 
 ---
 

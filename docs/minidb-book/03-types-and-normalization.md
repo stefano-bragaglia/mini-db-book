@@ -26,239 +26,365 @@ Why canonical forms? Equality. If `"Ada@Example.org"` and `"ada@example.org"` ar
 A value outside its type's domain is the first of several *constraint violations*. They share a base class, so callers can catch "the data was rejected" separately from "the schema is wrong":
 
 ```python
-# minidb/errors.py (append)
+# src/minidb/errors.py (append)
 class ConstraintError(DatabaseError):
-    """Data was rejected because it violates a rule of the schema."""
+    """Signal that data was rejected because it breaks a rule of the schema."""
 
 
 class DomainError(ConstraintError):
-    """A value does not belong to its column's type (domain)."""
+    """Signal that a value doesn't belong to its column's type (domain)."""
+```
+
+From now on, column values have a type of their own. A small module names the Python types a column can hold, so every other module can refer to them:
+
+```python
+# src/minidb/values.py (replace Row)
+type Value = bool | int | float | str | Decimal | dt.date | dt.datetime
+type Row = dict[str, Value | None]
+```
+
+```python
+# src/minidb/values.py (imports)
+import datetime as dt
+from decimal import Decimal
 ```
 
 ## 3.2 The `Type` base class
 
 A type is an object, not just a Python class, because types have parameters: `Integer(min=0, max=150)`, `Text(max_length=80)`, `Numeric(10, 2)`. We use frozen dataclasses for the concrete types. That gives them a readable `repr`, value equality (`Integer(0, 10) == Integer(0, 10)`) and hashability, all of which we'll use in [Chapter 13](13-persistence.md) to fingerprint schemas.
 
+`Type` is **generic** in the Python type it produces, written with the 3.12+ syntax `class Type[T: Value]`. `Integer` is a `Type[int]`, `Date` a `Type[dt.date]`. The type checker therefore knows that `Integer().normalize(x)` returns an `int | None`. Notice that `T` appears only in *return* types (`normalize`, `coerce`), never as a parameter. Python infers the variance of new-style type parameters from how they're used, so `Type` is **covariant**: an `Integer` is acceptable wherever a `Type[Value]` is expected, which is what a column needs. Range checks therefore live in `validate(value: object)` after an `isinstance` test, rather than in a method taking a `T`, which would make `Type` invariant.
+
+Errors are built by `error()` and raised by the caller (`raise self.error(value)`). A helper that raised by itself would hide the `raise` from linters, which would then complain that `coerce` may fall off its end without returning.
+
 Normalization is lenient about *input*. Validation is strict about *output*: it checks the **exact** Python type. That strictness matters because of a Python quirk. `bool` is a subclass of `int`, and `datetime` is a subclass of `date`, so `isinstance(True, int)` is `True`. Without exact checks, `True` would be a perfectly good age.
 
 ```python
-# minidb/types.py
-"""Column types. Each type knows how to normalize and validate its values."""
+# src/minidb/types.py
+"""Define column types: how each one normalizes and validates its values."""
+
 import datetime as dt
 import math
 import re
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
+from decimal import ROUND_HALF_EVEN
+from decimal import Decimal
+from decimal import InvalidOperation
+from typing import ClassVar
+from typing import override
 
 from minidb.errors import DomainError
+from minidb.values import Value
 
 _INT_RE = re.compile(r"[+-]?\d+")
+_TRUE = frozenset({"true", "t", "yes", "y", "on", "1"})
+_FALSE = frozenset({"false", "f", "no", "n", "off", "0"})
 
 
-class Type:
-    """Base class for column types.
+class Type[T: Value]:
+    """Describe a column type: how to normalize its values, and which are valid.
 
-    normalize(): turn an acceptable input into the canonical stored form.
-    validate():  check that a value already is in canonical form.
-    NULL (None) passes through both untouched; NOT NULL is a constraint,
-    not a type (see Chapter 4).
+    :meth:`normalize` turns an acceptable input into the one canonical value
+    that is stored; :meth:`validate` checks that a value already is canonical
+    and inside the type's domain. NULL (``None``) passes through both
+    untouched: whether a column may hold NULL is a constraint, not a type.
+
+    Subclasses set :attr:`exact_types`, override :meth:`coerce`, and extend
+    :meth:`validate` with rules such as ranges and lengths.
     """
-    exact_types: tuple[type, ...] = (object,)
 
-    def normalize(self, value):
-        if value is None:
+    exact_types: ClassVar[tuple[type, ...]] = ()
+
+    def normalize(self, value: object) -> T | None:
+        """Convert ``value`` to this type's canonical form.
+
+        :param value: any input; ``None`` is returned unchanged.
+        :return: the canonical value, or ``None``.
+        :raises DomainError: if ``value`` can't be converted.
+        """
+        return None if value is None else self.coerce(value)
+
+    def coerce(self, value: object) -> T:
+        """Convert a non-NULL ``value``; subclasses override this.
+
+        :param value: the input, never ``None``.
+        :return: the canonical value.
+        :raises DomainError: always, in the base class.
+        """
+        raise self.error(value)
+
+    def validate(self, value: object) -> None:
+        """Check that ``value`` is canonical and inside the domain.
+
+        The check is on the *exact* Python type: ``bool`` is a subclass of
+        ``int``, but ``True`` is not a valid integer.
+
+        :param value: the value to check; ``None`` always passes.
+        :raises DomainError: if the value is not valid.
+        """
+        if value is not None and type(value) not in self.exact_types:
+            raise self.error(value)
+
+    def error(self, value: object, reason: str = "") -> DomainError:
+        """Build the error that rejects ``value``.
+
+        :param value: the rejected value.
+        :param reason: why it was rejected; empty by default.
+        :return: an exception for the caller to raise.
+        """
+        return DomainError(f"{value!r} is not a valid {self!r}" + (f": {reason}" if reason else ""))
+
+
+def _integral(value: object) -> int | None:
+    """Return ``value`` as an int if it is a whole float or Decimal, or a numeric string."""
+    match value:
+        case float() if value.is_integer():
+            return int(value)
+        case Decimal() if value.is_finite() and value == value.to_integral_value():
+            return int(value)
+        case str() if _INT_RE.fullmatch(value.strip()):
+            return int(value.strip())
+        case _:
             return None
-        return self.coerce(value)
-
-    def coerce(self, value):
-        """Override: convert `value` or call self.reject(value)."""
-        return value
-
-    def validate(self, value) -> None:
-        if value is None:
-            return
-        if object not in self.exact_types and type(value) not in self.exact_types:
-            self.reject(value)
-        self.check(value)
-
-    def check(self, value) -> None:
-        """Override: extra domain rules such as ranges and lengths."""
-
-    def reject(self, value, reason: str = ""):
-        raise DomainError(f"{value!r} is not a valid {self!r}"
-                          + (f": {reason}" if reason else ""))
 
 
 @dataclass(frozen=True)
-class Integer(Type):
+class Integer(Type[int]):
+    """Hold whole numbers, optionally between ``min`` and ``max``.
+
+    >>> Integer(min=0).normalize(" 42 ")
+    42
+
+    :param min: the smallest valid value; ``None`` (the default) for no limit.
+    :param max: the largest valid value; ``None`` (the default) for no limit.
+    """
+
     min: int | None = None
     max: int | None = None
-    exact_types = (int,)
+    exact_types: ClassVar[tuple[type, ...]] = (int,)
 
-    def coerce(self, value):
-        match value:
-            case bool():
-                self.reject(value, "booleans are not integers")
-            case int():
-                return value
-            case float() if value.is_integer():
-                return int(value)
-            case Decimal() if value.is_finite() and value == value.to_integral_value():
-                return int(value)
-            case str() if _INT_RE.fullmatch(value.strip()):
-                return int(value.strip())
-        self.reject(value)
+    @override
+    def coerce(self, value: object) -> int:
+        if isinstance(value, bool):
+            raise self.error(value, "booleans are not integers")
+        if isinstance(value, int):
+            return value
+        number = _integral(value)
+        if number is None:
+            raise self.error(value)
+        return number
 
-    def check(self, value):
-        if self.min is not None and value < self.min:
-            self.reject(value, f"below minimum {self.min}")
-        if self.max is not None and value > self.max:
-            self.reject(value, f"above maximum {self.max}")
-
-
-@dataclass(frozen=True)
-class Real(Type):
-    exact_types = (float,)
-
-    def coerce(self, value):
-        match value:
-            case bool():
-                self.reject(value, "booleans are not numbers")
-            case int() | float() | Decimal():
-                result = float(value)
-            case str():
-                try:
-                    result = float(value.strip())
-                except ValueError:
-                    self.reject(value)
-            case _:
-                self.reject(value)
-        return result
-
-    def check(self, value):
-        if not math.isfinite(value):
-            self.reject(value, "NaN and infinities are not allowed")
+    @override
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, int):
+            if self.min is not None and value < self.min:
+                raise self.error(value, f"below minimum {self.min}")
+            if self.max is not None and value > self.max:
+                raise self.error(value, f"above maximum {self.max}")
 
 
 @dataclass(frozen=True)
-class Text(Type):
+class Real(Type[float]):
+    """Hold finite floating-point numbers; NaN and infinities are rejected.
+
+    >>> Real().normalize("2.5")
+    2.5
+    """
+
+    exact_types: ClassVar[tuple[type, ...]] = (float,)
+
+    @override
+    def coerce(self, value: object) -> float:
+        if isinstance(value, bool):
+            raise self.error(value, "booleans are not numbers")
+        if isinstance(value, int | float | Decimal):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                raise self.error(value) from None
+        raise self.error(value)
+
+    @override
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise self.error(value, "NaN and infinities are not allowed")
+
+
+@dataclass(frozen=True)
+class Text(Type[str]):
+    """Hold strings, optionally no longer than ``max_length`` characters.
+
+    >>> Text().normalize(42)
+    Traceback (most recent call last):
+      ...
+    minidb.errors.DomainError: 42 is not a valid Text(max_length=None): no implicit conversion to text
+
+    :param max_length: the longest valid string; ``None`` (the default) for no limit.
+    """
+
     max_length: int | None = None
-    exact_types = (str,)
+    exact_types: ClassVar[tuple[type, ...]] = (str,)
 
-    def coerce(self, value):
+    @override
+    def coerce(self, value: object) -> str:
         if not isinstance(value, str):
-            self.reject(value, "no implicit conversion to text")
+            raise self.error(value, "no implicit conversion to text")
         return value
 
-    def check(self, value):
-        if self.max_length is not None and len(value) > self.max_length:
-            self.reject(value, f"longer than {self.max_length} characters")
-
-
-_TRUE = {"true", "t", "yes", "y", "on", "1"}
-_FALSE = {"false", "f", "no", "n", "off", "0"}
-
-
-@dataclass(frozen=True)
-class Boolean(Type):
-    exact_types = (bool,)
-
-    def coerce(self, value):
-        match value:
-            case bool():
-                return value
-            case 0 | 1:
-                return bool(value)
-            case str() if value.strip().lower() in _TRUE:
-                return True
-            case str() if value.strip().lower() in _FALSE:
-                return False
-        self.reject(value)
+    @override
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, str) and self.max_length is not None and len(value) > self.max_length:
+            raise self.error(value, f"longer than {self.max_length} characters")
 
 
 @dataclass(frozen=True)
-class Numeric(Type):
-    """Exact decimal with `precision` total digits, `scale` after the point."""
+class Boolean(Type[bool]):
+    """Hold ``True`` or ``False``, accepting 0/1 and words such as "yes" and "off".
+
+    >>> Boolean().normalize("Yes"), Boolean().normalize(0)
+    (True, False)
+    """
+
+    exact_types: ClassVar[tuple[type, ...]] = (bool,)
+
+    @override
+    def coerce(self, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value in (0, 1):
+            return value == 1
+        word = value.strip().lower() if isinstance(value, str) else None
+        if word in _TRUE or word in _FALSE:
+            return word in _TRUE
+        raise self.error(value)
+
+
+def _to_decimal(value: object) -> Decimal | None:
+    """Return ``value`` as a Decimal, or ``None`` if it isn't a number."""
+    if isinstance(value, float):
+        return Decimal(repr(value))  # 0.1 -> Decimal('0.1'), not its binary value
+    if isinstance(value, int | Decimal) and not isinstance(value, bool):
+        return Decimal(value)
+    if isinstance(value, str):
+        try:
+            return Decimal(value.strip())
+        except InvalidOperation:
+            return None
+    return None
+
+
+@dataclass(frozen=True)
+class Numeric(Type[Decimal]):
+    """Hold exact decimals with ``precision`` digits, ``scale`` of them after the point.
+
+    Values are rounded to ``scale`` places with banker's rounding.
+
+    >>> Numeric(6, 2).normalize(0.1)
+    Decimal('0.10')
+
+    :param precision: the total number of digits; 18 by default.
+    :param scale: the digits after the decimal point; 2 by default.
+    :raises ValueError: unless ``0 <= scale <= precision``.
+    """
+
     precision: int = 18
     scale: int = 2
-    exact_types = (Decimal,)
+    exact_types: ClassVar[tuple[type, ...]] = (Decimal,)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not 0 <= self.scale <= self.precision:
             raise ValueError("need 0 <= scale <= precision")
 
-    def coerce(self, value):
-        match value:
-            case bool():
-                self.reject(value)
-            case float():
-                value = Decimal(repr(value))     # 0.1 -> Decimal('0.1')
-            case int() | Decimal():
-                value = Decimal(value)
-            case str():
-                try:
-                    value = Decimal(value.strip())
-                except InvalidOperation:
-                    self.reject(value)
-            case _:
-                self.reject(value)
-        if not value.is_finite():
-            self.reject(value, "NaN and infinities are not allowed")
-        return value.quantize(Decimal(1).scaleb(-self.scale), ROUND_HALF_EVEN)
+    @override
+    def coerce(self, value: object) -> Decimal:
+        number = _to_decimal(value)
+        if number is None:
+            raise self.error(value)
+        if not number.is_finite():
+            raise self.error(value, "NaN and infinities are not allowed")
+        return number.quantize(Decimal(1).scaleb(-self.scale), ROUND_HALF_EVEN)
 
-    def check(self, value):
+    @override
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if not isinstance(value, Decimal):
+            return
         if value.as_tuple().exponent != -self.scale:
-            self.reject(value, f"expected exactly {self.scale} decimal places")
-        digits_before_point = max(value.adjusted() + 1, 0)
-        if digits_before_point > self.precision - self.scale:
-            self.reject(value, f"too many digits for NUMERIC({self.precision}, {self.scale})")
+            raise self.error(value, f"expected exactly {self.scale} decimal places")
+        if max(value.adjusted() + 1, 0) > self.precision - self.scale:
+            raise self.error(value, f"too many digits for NUMERIC({self.precision}, {self.scale})")
 
 
 @dataclass(frozen=True)
-class Date(Type):
-    exact_types = (dt.date,)
+class Date(Type[dt.date]):
+    """Hold calendar dates, accepting ISO strings such as ``"2026-11-18"``.
 
-    def coerce(self, value):
-        match value:
-            case dt.datetime():
-                self.reject(value, "use .date() to drop the time explicitly")
-            case dt.date():
-                return value
-            case str():
-                try:
-                    return dt.date.fromisoformat(value.strip())
-                except ValueError:
-                    self.reject(value)
-        self.reject(value)
+    >>> Date().normalize("2026-11-18")
+    datetime.date(2026, 11, 18)
+    """
 
+    exact_types: ClassVar[tuple[type, ...]] = (dt.date,)
 
-@dataclass(frozen=True)
-class Timestamp(Type):
-    """A datetime. With with_timezone=True, values must be aware and are
-    stored in UTC; otherwise they must be naive."""
-    with_timezone: bool = True
-    exact_types = (dt.datetime,)
-
-    def coerce(self, value):
+    @override
+    def coerce(self, value: object) -> dt.date:
+        if isinstance(value, dt.datetime):
+            raise self.error(value, "use .date() to drop the time explicitly")
+        if isinstance(value, dt.date):
+            return value
         if isinstance(value, str):
             try:
-                value = dt.datetime.fromisoformat(value.strip())
+                return dt.date.fromisoformat(value.strip())
             except ValueError:
-                self.reject(value)
-        if not isinstance(value, dt.datetime):
-            self.reject(value)
-        aware = value.tzinfo is not None and value.utcoffset() is not None
-        if self.with_timezone:
-            if not aware:
-                self.reject(value, "a timezone is required")
-            return value.astimezone(dt.UTC)
-        if aware:
-            self.reject(value, "timezone not allowed")
-        return value
+                raise self.error(value) from None
+        raise self.error(value)
 
-    def check(self, value):
-        if self.with_timezone and value.utcoffset() != dt.timedelta(0):
-            self.reject(value, "must be stored in UTC")
+
+@dataclass(frozen=True)
+class Timestamp(Type[dt.datetime]):
+    """Hold points in time: all timezone-aware (stored in UTC), or all naive.
+
+    Python refuses to compare aware and naive datetimes, so a column must
+    pick one kind.
+
+    >>> Timestamp().normalize("2026-11-18T10:00:00+01:00")
+    datetime.datetime(2026, 11, 18, 9, 0, tzinfo=datetime.timezone.utc)
+
+    :param with_timezone: whether values must be aware; ``True`` by default.
+    """
+
+    with_timezone: bool = True
+    exact_types: ClassVar[tuple[type, ...]] = (dt.datetime,)
+
+    @override
+    def coerce(self, value: object) -> dt.datetime:
+        stamp = self._parse(value)
+        aware = stamp.utcoffset() is not None
+        if self.with_timezone and not aware:
+            raise self.error(value, "a timezone is required")
+        if not self.with_timezone and aware:
+            raise self.error(value, "timezone not allowed")
+        return stamp.astimezone(dt.UTC) if aware else stamp
+
+    def _parse(self, value: object) -> dt.datetime:
+        if isinstance(value, dt.datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return dt.datetime.fromisoformat(value.strip())
+            except ValueError:
+                raise self.error(value) from None
+        raise self.error(value)
+
+    @override
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, dt.datetime) and self.with_timezone and value.utcoffset() != dt.timedelta(0):
+            raise self.error(value, "must be stored in UTC")
 ```
 
 Some design decisions worth discussing:
@@ -313,39 +439,83 @@ Notice that `normalize("123.4")` *succeeded* for `Numeric(4, 2)` and `validate` 
 
 ## 3.3 Column normalizers
 
-Types normalize *representation*. Applications often want *semantic* normalization on top: trimming whitespace, lower-casing e-mail addresses, collapsing runs of spaces. These are plain functions that take a value and return a value:
+Types normalize *representation*. Applications often want *semantic* normalization on top: trimming whitespace, lower-casing e-mail addresses, collapsing runs of spaces. These are plain functions from a `Value` to a `Value`. Each one leaves values it doesn't understand unchanged, so its type is the same for every column:
 
 ```python
-# minidb/normalizers.py
-"""Small value normalizers for Column(normalizers=...).
+# src/minidb/normalizers.py
+"""Provide small value normalizers for ``Column(normalizers=...)``.
 
-Every normalizer must be idempotent: f(f(x)) == f(x). Rows are re-normalized
-whenever they are updated, so a non-idempotent normalizer would change data
-that nobody touched.
+Every normalizer must be idempotent, ``f(f(x)) == f(x)``: rows are
+re-normalized whenever they are updated, so a normalizer that isn't would
+change data nobody touched. Normalizers leave non-text values alone, so any
+of them can be put on any column.
 """
+
 import unicodedata
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from minidb.values import Value
 
 
-def strip(s: str) -> str:
-    return s.strip()
+def strip(value: Value) -> Value:
+    """Remove leading and trailing whitespace from text.
+
+    >>> strip("  Ada ")
+    'Ada'
+
+    :param value: the value to normalize.
+    :return: the stripped text, or ``value`` unchanged if it isn't text.
+    """
+    return value.strip() if isinstance(value, str) else value
 
 
-def lower(s: str) -> str:
-    return s.lower()
+def lower(value: Value) -> Value:
+    """Lower-case text.
+
+    >>> lower("Ada@Example.ORG")
+    'ada@example.org'
+
+    :param value: the value to normalize.
+    :return: the lower-cased text, or ``value`` unchanged if it isn't text.
+    """
+    return value.lower() if isinstance(value, str) else value
 
 
-def upper(s: str) -> str:
-    return s.upper()
+def upper(value: Value) -> Value:
+    """Upper-case text.
+
+    :param value: the value to normalize.
+    :return: the upper-cased text, or ``value`` unchanged if it isn't text.
+    """
+    return value.upper() if isinstance(value, str) else value
 
 
-def collapse_spaces(s: str) -> str:
-    """'  Ada   Lovelace ' -> 'Ada Lovelace'"""
-    return " ".join(s.split())
+def collapse_spaces(value: Value) -> Value:
+    """Trim text and replace each run of whitespace with a single space.
+
+    >>> collapse_spaces("  Ada   Lovelace ")
+    'Ada Lovelace'
+
+    :param value: the value to normalize.
+    :return: the collapsed text, or ``value`` unchanged if it isn't text.
+    """
+    return " ".join(value.split()) if isinstance(value, str) else value
 
 
-def nfc(s: str) -> str:
-    """Unicode NFC: one canonical byte sequence for visually equal text."""
-    return unicodedata.normalize("NFC", s)
+def nfc(value: Value) -> Value:
+    """Convert text to Unicode normalization form NFC.
+
+    Visually identical strings can be different sequences of code points;
+    NFC picks one canonical sequence for each.
+
+    >>> nfc("café") == "café"
+    True
+
+    :param value: the value to normalize.
+    :return: the NFC form of the text, or ``value`` unchanged if it isn't text.
+    """
+    return unicodedata.normalize("NFC", value) if isinstance(value, str) else value
 ```
 
 `nfc` needs explaining. The character "é" can be written as one code point (U+00E9) or as "e" followed by a combining acute accent (U+0065 U+0301). They look identical and are *different strings*:
@@ -368,41 +538,80 @@ Text pasted from a macOS file name is often decomposed; text typed on most keybo
 A `Column` combines a name, a type and a tuple of normalizers. A `TableSchema` is a named tuple of columns. It owns the pipeline that turns a dict of user values into a stored row.
 
 ```python
-# minidb/schema.py
-"""Declarative table definitions."""
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+# src/minidb/schema.py
+"""Declare tables: their columns, and the pipeline that prepares rows."""
 
-from minidb.errors import DomainError, SchemaError
-from minidb.types import Type
+from dataclasses import dataclass
+from dataclasses import field
+from typing import TYPE_CHECKING
 
-type Row = dict[str, object]
+from minidb.errors import DomainError
+from minidb.errors import SchemaError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Mapping
+
+    from minidb.types import Type
+    from minidb.values import Row
+    from minidb.values import Value
+
+type Normalizer = Callable[[Value], Value]
 
 
 @dataclass(frozen=True)
 class Column:
-    name: str
-    type: Type
-    normalizers: tuple[Callable[[object], object], ...] = ()
+    """Declare a column: its name, its type and how to normalize its values.
 
-    def prepare(self, value):
-        """Normalize, then validate one value. Raises DomainError."""
-        value = self.type.normalize(value)
-        if value is not None:
+    >>> from minidb.normalizers import strip
+    >>> from minidb.types import Integer
+    >>> Column("age", Integer(), normalizers=(strip,)).prepare(" 42 ")
+    42
+
+    :param name: the column's name.
+    :param type: the column's type.
+    :param normalizers: functions applied to every non-NULL value after the
+        type has normalized it; none by default.
+    """
+
+    name: str
+    type: Type[Value]
+    normalizers: tuple[Normalizer, ...] = ()
+
+    def prepare(self, value: object) -> Value | None:
+        """Normalize, then validate one value for this column.
+
+        :param value: the input value, or ``None``.
+        :return: the value to store.
+        :raises DomainError: if the value doesn't belong to the column's type.
+        """
+        prepared = self.type.normalize(value)
+        if prepared is not None:
             for fn in self.normalizers:
-                value = fn(value)
-        self.type.validate(value)
-        return value
+                prepared = fn(prepared)
+        self.type.validate(prepared)
+        return prepared
 
 
 @dataclass(frozen=True)
 class TableSchema:
+    """Declare a table: a name and an ordered tuple of columns.
+
+    >>> from minidb.types import Text
+    >>> schema = TableSchema("users", (Column("name", Text()),))
+    >>> schema.prepare_row({"name": "Ada"})
+    {'name': 'Ada'}
+
+    :param name: the table's name.
+    :param columns: its columns, in order.
+    :raises SchemaError: if two columns share a name.
+    """
+
     name: str
     columns: tuple[Column, ...]
     by_name: Mapping[str, Column] = field(init=False, repr=False, compare=False)
 
-    def __post_init__(self):
-        object.__setattr__(self, "columns", tuple(self.columns))
+    def __post_init__(self) -> None:
         names = [c.name for c in self.columns]
         if len(set(names)) != len(names):
             raise SchemaError(f"duplicate column names in {self.name!r}")
@@ -410,24 +619,36 @@ class TableSchema:
 
     @property
     def column_names(self) -> tuple[str, ...]:
+        """Return the column names, in order."""
         return tuple(c.name for c in self.columns)
 
     def column(self, name: str) -> Column:
+        """Return the column called ``name``.
+
+        :param name: the column's name.
+        :return: the column.
+        :raises SchemaError: if there is no such column.
+        """
         try:
             return self.by_name[name]
         except KeyError:
             raise SchemaError(f"{self.name}: no such column {name!r}") from None
 
-    def prepare_row(self, values: Mapping[str, object],
-                    base: Row | None = None) -> Row:
-        """Return a complete, normalized, validated row.
+    def prepare_row(self, values: Mapping[str, object], base: Row | None = None) -> Row:
+        """Return a complete, normalized and validated row.
 
-        `values` are the user's input; `base` is the existing row for an
-        update (None for an insert). Neither argument is modified.
+        Neither argument is modified.
+
+        :param values: the user's input, by column name.
+        :param base: the existing row, for an update; ``None`` (the default)
+            for an insert, where missing columns become ``None``.
+        :return: the row to store.
+        :raises SchemaError: if ``values`` names an unknown column.
+        :raises DomainError: if a value doesn't belong to its column's type.
         """
         for name in values:
-            self.column(name)                       # unknown column?
-        row = dict(base) if base is not None else dict.fromkeys(self.column_names)
+            self.column(name)  # unknown column?
+        row: Row = dict(base) if base is not None else dict.fromkeys(self.column_names)
         for name, value in values.items():
             try:
                 row[name] = self.by_name[name].prepare(value)
@@ -440,55 +661,174 @@ class TableSchema:
 
 ## 3.5 Tables with schemas
 
-`Table` now takes a `TableSchema` instead of a list of names and runs every insert and update through `prepare_row`. Replace the constructor and the two writers, and delete `_check_columns`. The schema does that job now.
+`Table` now takes a `TableSchema` instead of a list of names, and runs every insert and update through `prepare_row`. `_check_columns` is gone, because the schema does that job now. Here is the whole file:
 
 ```python
-# minidb/table.py (replace Table.__init__)
-    def __init__(self, schema: TableSchema):
+# src/minidb/table.py
+"""Store the rows of one table in memory.
+
+Rows live in a dict keyed by a hidden *rowid*: an integer from a counter that
+only goes up, so a rowid is never reused, even after its row is deleted.
+Every insert and update goes through the table's schema.
+"""
+
+from types import MappingProxyType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
+    from collections.abc import Mapping
+
+    from minidb.schema import TableSchema
+    from minidb.values import Row
+    from minidb.values import Value
+
+type Predicate = Callable[[Mapping[str, Value | None]], object]
+type Where = Predicate | None
+
+
+class Table:
+    """Hold the rows of one table, keyed by a hidden, never-reused rowid.
+
+    Rows are *values*: the table hands out copies, and replaces stored rows
+    instead of mutating them, so no caller can change a row behind its back.
+
+    >>> from minidb.schema import Column, TableSchema
+    >>> from minidb.types import Integer
+    >>> numbers = Table(TableSchema("numbers", (Column("n", Integer()),)))
+    >>> numbers.insert({"n": "7"})
+    1
+    >>> numbers.get(1)
+    {'n': 7}
+
+    :param schema: the table's declaration.
+    """
+
+    def __init__(self, schema: TableSchema) -> None:
         self.schema = schema
         self.name = schema.name
         self.columns = schema.column_names
         self.rows: dict[int, Row] = {}
         self._next_rowid = 1
-```
 
-```python
-# minidb/table.py (replace Table.insert)
-    def insert(self, values: Row) -> int:
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    # -- create ---------------------------------------------------------
+    def insert(self, values: Mapping[str, object]) -> int:
+        """Prepare a row through the schema, store it, and return its rowid.
+
+        :param values: the new row's values, by column name; missing
+            columns are stored as ``None``.
+        :return: the rowid of the new row.
+        :raises SchemaError: if ``values`` names an unknown column.
+        :raises DomainError: if a value doesn't belong to its column's type.
+        """
         row = self.schema.prepare_row(values)
         rowid = self._next_rowid
         self._next_rowid += 1
         self.rows[rowid] = row
         return rowid
-```
 
-```python
-# minidb/table.py (replace Table.update)
-    def update(self, changes: Row, where: Predicate | None = None) -> int:
-        targets = self.match(where)                                  # 1. decide
-        new_rows = {rid: self.schema.prepare_row(changes, base=self.rows[rid])
-                    for rid in targets}                              # 2. validate all
-        self.rows.update(new_rows)                                   # 3. modify
+    # -- read -----------------------------------------------------------
+    def get(self, rowid: int) -> Row | None:
+        """Return a copy of the row with ``rowid``.
+
+        :param rowid: the row to fetch.
+        :return: a copy of the row, or ``None`` if there is no such row.
+        """
+        row = self.rows.get(rowid)
+        return dict(row) if row is not None else None
+
+    def scan(self) -> Iterator[tuple[int, Row]]:
+        """Yield every ``(rowid, row)`` pair, each row a fresh copy.
+
+        :return: an iterator over the table, in insertion order.
+        """
+        for rowid, row in self.rows.items():
+            yield rowid, dict(row)
+
+    def match(self, where: Where = None) -> list[int]:
+        """Return the rowids of the rows that satisfy ``where``.
+
+        The predicate sees each row through a read-only view.
+
+        :param where: decides which rows match; ``None`` (the default)
+            matches every row.
+        :return: the matching rowids.
+        """
+        if where is None:
+            return list(self.rows)
+        return [rid for rid, row in self.rows.items() if where(MappingProxyType(row))]
+
+    def select(self, where: Where = None) -> list[Row]:
+        """Return copies of the rows that satisfy ``where``.
+
+        :param where: decides which rows match; ``None`` (the default)
+            matches every row.
+        :return: the matching rows.
+        """
+        return [dict(self.rows[rid]) for rid in self.match(where)]
+
+    # -- update ---------------------------------------------------------
+    def update(self, changes: Mapping[str, object], where: Where = None) -> int:
+        """Set the columns in ``changes`` on every row that satisfies ``where``.
+
+        Every new row is prepared before any is stored, so a value that fails
+        validation leaves the whole table unchanged.
+
+        :param changes: the new values, by column name.
+        :param where: decides which rows change; ``None`` (the default)
+            changes every row.
+        :return: the number of rows changed.
+        :raises SchemaError: if ``changes`` names an unknown column.
+        :raises DomainError: if a value doesn't belong to its column's type.
+        """
+        targets = self.match(where)  # 1. decide
+        new_rows = {rid: self.schema.prepare_row(changes, base=self.rows[rid]) for rid in targets}  # 2. validate
+        self.rows.update(new_rows)  # 3. modify
+        return len(targets)
+
+    # -- delete ---------------------------------------------------------
+    def delete(self, where: Where = None) -> int:
+        """Remove every row that satisfies ``where``.
+
+        :param where: decides which rows go; ``None`` (the default) removes
+            every row.
+        :return: the number of rows removed.
+        """
+        targets = self.match(where)
+        for rowid in targets:
+            del self.rows[rowid]
         return len(targets)
 ```
 
-```python
-# minidb/table.py (replace Table._check_columns)
-    # _check_columns is gone: TableSchema.prepare_row rejects unknown columns.
-```
 
-```python
-# minidb/table.py (imports)
-from minidb.schema import TableSchema
-```
+
+
 
 The update now has *three* phases. If preparing the 500th row fails, rows 1–499 have not been touched: the statement is atomic. Keep this "validate everything, then write everything" shape in mind. It grows into the Unit of Work in [Chapter 8](08-unit-of-work-i.md).
 
-`Database.create_table` now takes `Column` objects:
+`Database.create_table` now takes `Column` objects. `Column` is only used in an annotation, so it is imported in the `if TYPE_CHECKING:` block, while `TableSchema` is needed at run time:
 
 ```python
-# minidb/database.py (replace Database.create_table)
-    def create_table(self, name: str, columns: list[Column]) -> Table:
+# src/minidb/database.py (replace Database.create_table)
+    def create_table(self, name: str, columns: Sequence[Column]) -> Table:
+        """Create an empty table and return it.
+
+        >>> from minidb.schema import Column
+        >>> from minidb.types import Text
+        >>> db = Database()
+        >>> db.create_table("users", [Column("name", Text())]).columns
+        ('name',)
+
+        :param name: the new table's name.
+        :param columns: its columns, in order.
+        :return: the new table.
+        :raises SchemaError: if the table already exists, or two columns
+            share a name.
+        """
         if name in self.tables:
             raise SchemaError(f"table {name!r} already exists")
         table = self.tables[name] = Table(TableSchema(name, tuple(columns)))
@@ -496,25 +836,52 @@ The update now has *three* phases. If preparing the 500th row fails, rows 1–49
 ```
 
 ```python
-# minidb/database.py (imports)
-from minidb.schema import Column, TableSchema
+# src/minidb/database.py (imports)
+from minidb.schema import TableSchema
+```
+
+```python
+# src/minidb/database.py (typing imports)
+from minidb.schema import Column
 ```
 
 And the package exports the new names:
 
 ```python
-# minidb/__init__.py
-"""minidb: a small relational database, built in the book."""
-from minidb.database import Database
-from minidb.errors import ConstraintError, DatabaseError, DomainError, SchemaError
-from minidb.schema import Column, TableSchema
-from minidb.types import Boolean, Date, Integer, Numeric, Real, Text, Timestamp
+# src/minidb/__init__.py
+"""Build a small relational database, one chapter at a time."""
+
 from minidb import normalizers
+from minidb.database import Database
+from minidb.errors import ConstraintError
+from minidb.errors import DatabaseError
+from minidb.errors import DomainError
+from minidb.errors import SchemaError
+from minidb.schema import Column
+from minidb.schema import TableSchema
+from minidb.types import Boolean
+from minidb.types import Date
+from minidb.types import Integer
+from minidb.types import Numeric
+from minidb.types import Real
+from minidb.types import Text
+from minidb.types import Timestamp
 
 __all__ = [
-    "Database", "DatabaseError", "SchemaError", "ConstraintError", "DomainError",
-    "Column", "TableSchema",
-    "Integer", "Real", "Text", "Boolean", "Numeric", "Date", "Timestamp",
+    "Boolean",
+    "Column",
+    "ConstraintError",
+    "Database",
+    "DatabaseError",
+    "Date",
+    "DomainError",
+    "Integer",
+    "Numeric",
+    "Real",
+    "SchemaError",
+    "TableSchema",
+    "Text",
+    "Timestamp",
     "normalizers",
 ]
 ```
@@ -559,9 +926,11 @@ Database people use "normalization" for a second, unrelated idea: **schema norma
 2. Our normalizers must be idempotent. Write a normalizer that *isn't* (e.g. one that appends a suffix) and show the bug it causes when a row is updated twice.
 3. Add a `Choice(*allowed)` type for enumerations, e.g. `Choice("draft", "sent", "paid")`. Should `"DRAFT"` be accepted? Where would you put that decision: in the type, or in a normalizer?
 4. Add a `Json` type whose canonical form is an immutable structure (tuples instead of lists, `MappingProxyType` or sorted tuples of pairs instead of dicts). Why must it be immutable? (Recall [§2.3](02-tables-and-crud.md#copies-out-never-references).)
-5. `Numeric.check` rejects values with too many digits. What happens to `Numeric(4, 2).normalize("99.995")`? Is the error message helpful? Improve it.
+5. `Numeric.validate` rejects values with too many digits. What happens to `Numeric(4, 2).normalize("99.995")`? Is the error message helpful? Improve it.
 6. PostgreSQL treats NaN as equal to itself and larger than any number. Implement a `Real(allow_nan=True)` option with those semantics. Where else in the system would this choice leak? (Think of sorting in [Chapter 7](07-query-primitives.md).)
 7. *(Schema design)* This table stores orders: `(order_id, customer_name, customer_address, product, product_price, quantity)`. Which facts are repeated? Split it into normalized tables and name the keys of each.
+
+*Answers: [Appendix D, Chapter 3](appendix-d-answers.md#chapter-3--types-and-normalization).*
 
 ---
 

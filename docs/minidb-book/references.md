@@ -1,4 +1,4 @@
-[🏠 Contents](index.md) · [← Previous: Appendix C — The Complete Code](appendix-c-complete-code.md)
+[🏠 Contents](index.md) · [← Previous: Appendix D — Answers to the Exercises](appendix-d-answers.md)
 
 # References
 
@@ -19,7 +19,7 @@ Every work cited in the book, grouped by topic. Each entry links back to the cha
 - <a id="silberschatz2019"></a>A. Silberschatz, H. F. Korth, S. Sudarshan. *Database System Concepts*, 7th ed. McGraw-Hill, 2019.  
   *Cited in:* [Chapter 1](01-relational-model.md)
 - <a id="petrov2019"></a>A. Petrov. *Database Internals: A Deep Dive into How Distributed Data Systems Work.* O'Reilly, 2019.  
-  *Cited in:* [Chapter 5](05-keys-and-indexes.md), [Chapter 15](15-b-trees.md)
+  *Cited in:* [Chapter 5](05-keys-and-indexes.md), [Chapter 15](15-b-trees.md), [Appendix D](appendix-d-answers.md)
 - <a id="fowler2002"></a>M. Fowler. *Patterns of Enterprise Application Architecture.* Addison-Wesley, 2002. Pattern summaries online: [Unit of Work](https://martinfowler.com/eaaCatalog/unitOfWork.html), [Identity Map](https://martinfowler.com/eaaCatalog/identityMap.html).  
   *Cited in:* [Chapter 8](08-unit-of-work-i.md), [Chapter 9](09-unit-of-work-ii.md)
 
@@ -36,9 +36,11 @@ Every work cited in the book, grouped by topic. Each entry links back to the cha
 - <a id="berenson1995"></a>★ H. Berenson, P. Bernstein, J. Gray, J. Melton, E. O'Neil, P. O'Neil. "A Critique of ANSI SQL Isolation Levels." *Proc. ACM SIGMOD*, 1995.  
   *Cited in:* [Chapter 12](12-isolation.md)
 - <a id="mohan1992"></a>C. Mohan, D. Haderle, B. Lindsay, H. Pirahesh, P. Schwarz. "ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging." *ACM Transactions on Database Systems* 17(1):94–162, 1992. [doi:10.1145/128765.128770](https://doi.org/10.1145/128765.128770)  
-  *Cited in:* [Chapter 8](08-unit-of-work-i.md), [Chapter 13](13-persistence.md), [Chapter 15](15-b-trees.md)
+  *Cited in:* [Chapter 8](08-unit-of-work-i.md), [Chapter 13](13-persistence.md), [Chapter 15](15-b-trees.md), [Appendix D](appendix-d-answers.md)
 - <a id="pillai2014"></a>T. S. Pillai, V. Chidambaram, R. Alagappan, S. Al-Kiswany, A. C. Arpaci-Dusseau, R. H. Arpaci-Dusseau. "All File Systems Are Not Created Equal: On the Complexity of Crafting Crash-Consistent Applications." *Proc. USENIX OSDI*, 2014.  
   *Cited in:* [Chapter 13](13-persistence.md)
+- <a id="ports2012"></a>D. R. K. Ports, K. Grittner. "Serializable Snapshot Isolation in PostgreSQL." *Proceedings of the VLDB Endowment* 5(12):1850–1861, 2012.  
+  *Cited in:* [Appendix D](appendix-d-answers.md)
 
 ## Concurrency and synchronization
 
@@ -56,6 +58,8 @@ Every work cited in the book, grouped by topic. Each entry links back to the cha
   *Cited in:* [Chapter 10](10-concurrency-i.md)
 - <a id="pep779"></a>T. Wouters, M. Page, S. Gross. *PEP 779 – Criteria for supported status for free-threaded Python.* 2025. <https://peps.python.org/pep-0779/>  
   *Cited in:* [Chapter 10](10-concurrency-i.md)
+- <a id="brandenburg2009"></a>B. B. Brandenburg, J. H. Anderson. "Reader-Writer Synchronization for Shared-Memory Multiprocessor Real-Time Systems." *Proc. Euromicro Conference on Real-Time Systems (ECRTS)*, 184–193, 2009. (Phase-fair locks.)  
+  *Cited in:* [Appendix D](appendix-d-answers.md)
 
 ## Query processing and optimization
 
@@ -98,6 +102,8 @@ Every work cited in the book, grouped by topic. Each entry links back to the cha
   *Cited in:* [Appendix A](appendix-a-sql-parser.md)
 - <a id="uax15"></a>Unicode Consortium. *Unicode Standard Annex #15: Unicode Normalization Forms.* <https://unicode.org/reports/tr15/>  
   *Cited in:* [Chapter 3](03-types-and-normalization.md)
+- <a id="sqlalchemy"></a>SQLAlchemy. "Session Basics" and "Unit of Work" (ORM documentation). <https://docs.sqlalchemy.org/en/20/orm/session_basics.html>  
+  *Cited in:* [Appendix D](appendix-d-answers.md)
 
 ---
 

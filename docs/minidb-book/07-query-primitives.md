@@ -40,23 +40,50 @@ Two properties make this model last:
 
 ## 7.2 Rows with qualified names
 
-When two tables are joined, both may have an `id` column. The toy in [Chapter 1](01-relational-model.md#12-a-database-in-30-lines) lost one of them in `l | r`. Our operators therefore key rows by **qualified names**, `alias.column`, so a joined row has both `u.id` and `o.id`. Typing `r["u.city"]` everywhere would be tedious, though. So rows also accept the *unqualified* name when exactly one column has it, as SQL does:
+When two tables are joined, both may have an `id` column. The toy in [Chapter 1](01-relational-model.md#12-a-database-in-forty-lines) lost one of them in `lrow | rrow`. The operators live in a new module, `operators.py`, and they key rows by **qualified names**, `alias.column`, so a joined row has both `u.id` and `o.id`. Typing `r["u.city"]` everywhere would be tedious, though. So rows also accept the *unqualified* name when exactly one column has it, as SQL does:
 
 ```python
-# minidb/query.py
-"""Query operators (the iterator model) and a fluent query builder."""
+# src/minidb/operators.py
+"""Implement query operators in the iterator (Volcano) model.
+
+Every operator is iterable: it yields :class:`Row` objects, which it gets by
+iterating over its child operators. A query is a tree of operators, and
+iterating over the root makes rows flow up from the leaves.
+"""
+
 import itertools
-from collections.abc import Callable, Iterator
-from typing import Any
+from typing import TYPE_CHECKING
+from typing import Protocol
+from typing import cast
+from typing import override
+
+from minidb.values import ordered
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
+
+    from minidb.values import Ordered
+    from minidb.values import Row as StoredRow
+    from minidb.values import Value
 
 
-class Row(dict):
-    """A result row keyed by qualified names ('u.age').
+class Row(dict[str, "Value | None"]):
+    """Hold a result row, keyed by qualified names such as ``"u.age"``.
 
-    Unqualified names ('age') also work when they are unambiguous.
+    An unqualified name such as ``"age"`` also works when exactly one
+    column has it.
+
+    >>> row = Row({"u.id": 1, "o.id": 10, "o.total": 25})
+    >>> row["total"]
+    25
+    >>> row["id"]
+    Traceback (most recent call last):
+      ...
+    KeyError: "ambiguous column 'id': one of ['o.id', 'u.id']"
     """
 
-    def __missing__(self, key: str):
+    def __missing__(self, key: str) -> Value | None:
         if "." not in key:
             found = [k for k in self if k.rpartition(".")[2] == key]
             if len(found) == 1:
@@ -66,172 +93,333 @@ class Row(dict):
         raise KeyError(key)
 ```
 
+The operators need to *compare* values: to sort them, and to find a minimum or maximum. A column always holds values of a single type, so two of its values can always be compared, but the type checker only sees `Value`, a union of several types, and `int < str` is not something it can allow. Two small protocols say precisely what we rely on, and two helpers state the assumption at each place it's made:
+
+```python
+# src/minidb/values.py (append)
+class Ordered(Protocol):
+    """Describe values that can be ordered among themselves."""
+
+    def __lt__(self, other: Self, /) -> bool: ...
+    def __le__(self, other: Self, /) -> bool: ...
+    def __gt__(self, other: Self, /) -> bool: ...
+    def __ge__(self, other: Self, /) -> bool: ...
+
+
+class Arithmetic(Protocol):
+    """Describe values that support the four arithmetic operators among themselves."""
+
+    def __add__(self, other: Self, /) -> Self: ...
+    def __sub__(self, other: Self, /) -> Self: ...
+    def __mul__(self, other: Self, /) -> Self: ...
+    def __truediv__(self, other: Self, /) -> Self: ...
+
+
+def ordered(value: Value | None) -> Ordered:
+    """Return ``value``, typed as orderable.
+
+    Values from one column share a Python type, so they can be compared;
+    the type checker can't know that, and this function says so.
+
+    :param value: a value from a column (or a constant of the column's type).
+    :return: the same object.
+    """
+    return cast("Ordered", value)
+
+
+def arithmetic(value: Value) -> Arithmetic:
+    """Return ``value``, typed as supporting arithmetic; see :func:`ordered`.
+
+    :param value: a numeric value.
+    :return: the same object.
+    """
+    return cast("Arithmetic", value)
+```
+
+```python
+# src/minidb/values.py (imports)
+from typing import Protocol
+from typing import Self
+from typing import cast
+```
+
+Scans read from a **source**: anything with a name, column names and a `scan()` method. `Table` already is one. Describing sources with a protocol means a scan can later read from things that aren't tables, such as a transaction's private view of a table ([Chapter 9](09-unit-of-work-ii.md)).
+
+```python
+# src/minidb/operators.py (append)
+class Source(Protocol):
+    """Describe something a :class:`Scan` can read: a table, or a view of one."""
+
+    name: str
+    columns: tuple[str, ...]
+
+    def scan(self) -> Iterator[tuple[int, StoredRow]]:
+        """Yield every ``(rowid, row)`` pair."""
+        ...
+
+
+type RowPredicate = Callable[[Row], object]
+type RowFunction = Callable[[Row], Value | None]
+type SortKey = tuple[str | RowFunction, bool]
+```
+
 `dict.__missing__` is called by `dict.__getitem__` when a key isn't found, which makes it a cheap hook for the fallback lookup. (It only affects `row[key]`, not `row.get(key)`, which is a subtlety Exercise 1 explores.)
 
 ## 7.3 Operators
 
-Each operator is a class with an `__iter__` generator, a `columns()` method listing the names of the columns it produces, and a short `label` for printing plans.
+Each operator is a class with an `__iter__` generator, a `columns()` method listing the names of the columns it produces, and a short `label` for printing plans. Overriding methods are marked with `@override` (from `typing`), which makes the type checker verify that the method really overrides something. A typo in a method name can't silently create a new method.
 
 ```python
-# minidb/query.py (append)
+# src/minidb/operators.py (append)
 class Operator:
-    """Base class. Subclasses implement __iter__, columns() and label."""
-    children: tuple["Operator", ...] = ()
+    """Produce rows when iterated; the base class of every operator.
+
+    Subclasses implement :meth:`__iter__`, :meth:`columns` and :attr:`label`.
+    """
+
+    children: tuple[Operator, ...] = ()
 
     def __iter__(self) -> Iterator[Row]:
         raise NotImplementedError
 
     def columns(self) -> list[str]:
+        """Return the names of the columns this operator produces.
+
+        :return: the names, by default those of the first child.
+        """
         return self.children[0].columns()
 
     @property
     def label(self) -> str:
+        """Return a one-line description, used by :meth:`explain`."""
         return type(self).__name__
 
     def explain(self, indent: int = 0) -> str:
+        """Describe the operator tree rooted here, one operator per line.
+
+        :param indent: the nesting depth of this operator; 0 by default.
+        :return: the indented description.
+        """
         lines = ["  " * indent + self.label]
         lines += [child.explain(indent + 1) for child in self.children]
         return "\n".join(lines)
 
 
 class Scan(Operator):
-    """Leaf: every row of a table, with names qualified by `alias`."""
+    """Yield every row of a source, with names qualified by ``alias``.
 
-    def __init__(self, table, alias: str | None = None):
-        self.table = table
-        self.alias = alias or table.name
+    :param source: the table (or view) to read.
+    :param alias: the qualifier for column names; ``None`` (the default)
+        uses the source's name.
+    """
 
-    def __iter__(self):
-        names = [(c, f"{self.alias}.{c}") for c in self.table.columns]
-        for _, row in self.table.scan():
+    def __init__(self, source: Source, alias: str | None = None) -> None:
+        self.source = source
+        self.alias = alias or source.name
+
+    @override
+    def __iter__(self) -> Iterator[Row]:
+        names = [(c, f"{self.alias}.{c}") for c in self.source.columns]
+        for _, row in self.source.scan():
             yield Row({q: row[c] for c, q in names})
 
-    def columns(self):
-        return [f"{self.alias}.{c}" for c in self.table.columns]
+    @override
+    def columns(self) -> list[str]:
+        return [f"{self.alias}.{c}" for c in self.source.columns]
 
     @property
-    def label(self):
-        return f"Scan {self.table.name} AS {self.alias}"
+    @override
+    def label(self) -> str:
+        return f"Scan {self.source.name} AS {self.alias}"
 
 
 class Filter(Operator):
-    """σ: keep rows for which `predicate(row)` is true."""
+    """Keep the rows for which ``predicate`` is exactly ``True`` (WHERE semantics).
 
-    def __init__(self, child: Operator, predicate: Callable[[Row], Any]):
+    :param child: the input.
+    :param predicate: a function of the row; ``False`` and ``None``
+        (UNKNOWN) both drop the row.
+    """
+
+    def __init__(self, child: Operator, predicate: RowPredicate) -> None:
         self.children = (child,)
         self.predicate = predicate
 
-    def __iter__(self):
+    @override
+    def __iter__(self) -> Iterator[Row]:
         return (row for row in self.children[0] if self.predicate(row) is True)
 
     @property
-    def label(self):
+    @override
+    def label(self) -> str:
         return f"Filter {getattr(self.predicate, '__name__', self.predicate)}"
 
 
 class Project(Operator):
-    """π: compute output columns. `outputs` maps a name to a column or a function."""
+    """Compute output columns, each from a column name or a function of the row.
 
-    def __init__(self, child: Operator, outputs: dict[str, str | Callable[[Row], Any]]):
+    :param child: the input.
+    :param outputs: ``{output name: source column or function}``.
+    """
+
+    def __init__(self, child: Operator, outputs: dict[str, str | RowFunction]) -> None:
         self.children = (child,)
         self.outputs = outputs
 
-    def __iter__(self):
-        getters = [(name, src if callable(src) else (lambda r, c=src: r[c]))
-                   for name, src in self.outputs.items()]
+    @override
+    def __iter__(self) -> Iterator[Row]:
+        getters = [(name, _getter(src)) for name, src in self.outputs.items()]
         for row in self.children[0]:
             yield Row({name: get(row) for name, get in getters})
 
-    def columns(self):
+    @override
+    def columns(self) -> list[str]:
         return list(self.outputs)
 
     @property
-    def label(self):
+    @override
+    def label(self) -> str:
         return f"Project {', '.join(self.outputs)}"
 
 
-class NestedLoopJoin(Operator):
-    """⋈: every pair (l, r) with on(l | r) true. kind='left' keeps unmatched l."""
+def _getter(source: str | RowFunction) -> RowFunction:
+    """Turn a column name into a function that reads it; leave functions alone."""
+    if callable(source):
+        return source
+    return lambda row: row[source]
 
-    def __init__(self, left: Operator, right: Operator,
-                 on: Callable[[Row], Any] | None = None, kind: str = "inner"):
+
+class NestedLoopJoin(Operator):
+    """Join every pair of rows for which ``on`` is true.
+
+    The right input is read once into a list: an operator may not be safely
+    iterable twice, or may be expensive to re-run.
+
+    :param left: the outer input.
+    :param right: the inner input.
+    :param on: the join condition; ``None`` (the default) joins every pair.
+    :param kind: ``"inner"`` (the default), or ``"left"`` to keep unmatched
+        left rows, padded with NULLs.
+    :raises ValueError: for any other ``kind``.
+    """
+
+    def __init__(
+        self, left: Operator, right: Operator, on: RowPredicate | None = None, kind: JoinKind = "inner"
+    ) -> None:
         if kind not in ("inner", "left"):
             raise ValueError("kind must be 'inner' or 'left'")
         self.children = (left, right)
         self.on, self.kind = on, kind
 
-    def __iter__(self):
+    @override
+    def __iter__(self) -> Iterator[Row]:
         left, right = self.children
-        inner = list(right)                        # materialize once: blocking
+        inner = list(right)  # materialize once: blocking
         nulls = dict.fromkeys(right.columns())
-        for l in left:
-            matched = False
-            for r in inner:
-                row = Row(l | r)
-                if self.on is None or self.on(row) is True:
-                    matched = True
-                    yield row
-            if not matched and self.kind == "left":
-                yield Row(l | nulls)
+        for lrow in left:
+            matches = [row for r in inner if self._matches(row := Row(lrow | r))]
+            yield from matches
+            if not matches and self.kind == "left":
+                yield Row(lrow | nulls)
 
-    def columns(self):
+    def _matches(self, row: Row) -> bool:
+        return self.on is None or self.on(row) is True
+
+    @override
+    def columns(self) -> list[str]:
         return self.children[0].columns() + self.children[1].columns()
 
     @property
-    def label(self):
+    @override
+    def label(self) -> str:
         return f"NestedLoopJoin ({self.kind})"
 
 
 class Sort(Operator):
-    """Order rows by keys [(column or function, descending)]. NULLs sort first."""
+    """Order rows by several keys, each ascending or descending; NULLs sort first.
 
-    def __init__(self, child: Operator, keys: list[tuple[str | Callable, bool]]):
+    :param child: the input.
+    :param keys: ``(column name or function, descending)`` pairs, most
+        significant first.
+    """
+
+    def __init__(self, child: Operator, keys: list[SortKey]) -> None:
         self.children = (child,)
         self.keys = keys
 
-    def __iter__(self):
-        rows = list(self.children[0])              # blocking
-        for key, descending in reversed(self.keys):
-            get = key if callable(key) else (lambda r, c=key: r[c])
+    @override
+    def __iter__(self) -> Iterator[Row]:
+        rows = list(self.children[0])  # blocking
+        for key, descending in reversed(self.keys):  # stable sorts, last key first
+            get = _getter(key)
             rows.sort(key=lambda r: _nulls_first(get(r)), reverse=descending)
         return iter(rows)
 
     @property
-    def label(self):
+    @override
+    def label(self) -> str:
         return "Sort " + ", ".join(f"{k}{' DESC' if d else ''}" for k, d in self.keys)
 
 
-def _nulls_first(value):
-    # (False, None) < (True, anything): NULL sorts before every value,
-    # and None itself is never compared with a real value.
-    return (value is not None, value)
+def _nulls_first(value: Value | None) -> tuple[bool, Ordered]:
+    """Make a sort key under which NULL sorts before every value.
+
+    ``(False, None) < (True, anything)``, so ``None`` is never compared with
+    a real value.
+    """
+    return (value is not None, ordered(value))
 
 
 class Limit(Operator):
-    def __init__(self, child: Operator, count: int | None, offset: int = 0):
+    """Skip ``offset`` rows, then yield at most ``count``.
+
+    :param child: the input.
+    :param count: the maximum number of rows; ``None`` for no maximum.
+    :param offset: how many rows to skip first; 0 by default.
+    """
+
+    def __init__(self, child: Operator, count: int | None, offset: int = 0) -> None:
         self.children = (child,)
         self.count, self.offset = count, offset
 
-    def __iter__(self):
+    @override
+    def __iter__(self) -> Iterator[Row]:
         stop = None if self.count is None else self.offset + self.count
         return itertools.islice(self.children[0], self.offset, stop)
 
     @property
-    def label(self):
+    @override
+    def label(self) -> str:
         return f"Limit {self.count} offset {self.offset}"
 
 
 class Distinct(Operator):
-    def __init__(self, child: Operator):
+    """Drop rows equal to an earlier row, keeping the first of each.
+
+    :param child: the input.
+    """
+
+    def __init__(self, child: Operator) -> None:
         self.children = (child,)
 
-    def __iter__(self):
-        seen = set()
+    @override
+    def __iter__(self) -> Iterator[Row]:
+        seen: set[tuple[tuple[str, Value | None], ...]] = set()
         for row in self.children[0]:
             key = tuple(row.items())
             if key not in seen:
                 seen.add(key)
                 yield row
+```
+
+```python
+# src/minidb/operators.py (append)
+type JoinKind = Literal["inner", "left"]
+```
+
+```python
+# src/minidb/operators.py (imports)
+from typing import Literal
 ```
 
 A few details are worth slowing down for.
@@ -246,99 +434,196 @@ A few details are worth slowing down for.
 
 ## 7.4 Aggregation
 
-Aggregation collapses many rows into one per **group**. An aggregate function is a tiny state machine: an initial state, a `step` that folds in one value, and a `finish` that turns the state into the result. Every SQL aggregate except `COUNT(*)` **ignores NULLs**, and `SUM` of no rows is NULL, not 0.
+Aggregation collapses many rows into one per **group**. Each group needs its own running state, such as a count or a sum so far. An aggregate *function* (`Count`, `Sum` …) therefore makes one **accumulator** per group: an object that folds in values one at a time with `add` and reports a `result`. `Accumulator` is a protocol, and `AggregateFunction` is generic in the kind of accumulator it makes. Every SQL aggregate except `COUNT(*)` **ignores NULLs**, and `SUM` of no rows is NULL, not 0.
 
 ```python
-# minidb/query.py (append)
-class AggregateFunction:
-    """Base for aggregates. `column=None` means 'the whole row' (COUNT(*))."""
+# src/minidb/operators.py (append)
+class Accumulator(Protocol):
+    """Fold the values of one group into a single result."""
 
-    def __init__(self, column: str | None = None):
+    def add(self, value: Value) -> None:
+        """Fold in one non-NULL value."""
+        ...
+
+    def result(self) -> Value | None:
+        """Return the aggregate of the values added so far."""
+        ...
+
+
+class AggregateFunction[A: Accumulator]:
+    """Name an aggregate over a column, and make one accumulator per group.
+
+    The type parameter is the kind of accumulator the function makes. It
+    appears only as a return type, so ``AggregateFunction`` is covariant: a
+    ``Count`` is an ``AggregateFunction[Accumulator]``.
+
+    :param column: the column to aggregate; ``None`` (the default) means
+        the whole row, as in ``COUNT(*)``.
+    """
+
+    def __init__(self, column: str | None = None) -> None:
         self.column = column
 
-    def start(self):
-        return None
+    def accumulator(self) -> A:
+        """Return a fresh accumulator for one group; subclasses override this.
 
-    def step(self, state, value):
+        :return: the accumulator.
+        """
         raise NotImplementedError
 
-    def finish(self, state):
-        return state
-
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"{type(self).__name__.upper()}({self.column or '*'})"
 
 
-class Count(AggregateFunction):
-    def start(self):
-        return 0
+class _CountAcc:
+    def __init__(self) -> None:
+        self.n = 0
 
-    def step(self, state, value):
-        return state + 1
+    def add(self, value: Value) -> None:  # noqa: ARG002 - only the number of values matters
+        self.n += 1
 
-
-class Sum(AggregateFunction):
-    def step(self, state, value):
-        return value if state is None else state + value
+    def result(self) -> Value | None:
+        return self.n
 
 
-class Min(AggregateFunction):
-    def step(self, state, value):
-        return value if state is None or value < state else state
+class _SumAcc:
+    def __init__(self) -> None:
+        self.total: Value | None = None
+
+    def add(self, value: Value) -> None:
+        self.total = value if self.total is None else cast("Value", arithmetic(self.total) + arithmetic(value))
+
+    def result(self) -> Value | None:
+        return self.total
 
 
-class Max(AggregateFunction):
-    def step(self, state, value):
-        return value if state is None or value > state else state
+class _AvgAcc(_SumAcc):
+    def __init__(self) -> None:
+        super().__init__()
+        self.n = 0
+
+    @override
+    def add(self, value: Value) -> None:
+        super().add(value)
+        self.n += 1
+
+    @override
+    def result(self) -> Value | None:
+        if self.total is None:
+            return None
+        return cast("Value", arithmetic(self.total) / arithmetic(self.n))
 
 
-class Avg(AggregateFunction):
-    def start(self):
-        return (0, 0)
+class _ExtremeAcc:
+    def __init__(self, *, largest: bool) -> None:
+        self.largest = largest
+        self.best: Value | None = None
 
-    def step(self, state, value):
-        return (state[0] + value, state[1] + 1)
+    def add(self, value: Value) -> None:
+        if self.best is None or (ordered(value) > ordered(self.best)) == self.largest:
+            self.best = value
 
-    def finish(self, state):
-        total, n = state
-        return None if n == 0 else total / n
+    def result(self) -> Value | None:
+        return self.best
+
+
+class Count(AggregateFunction[_CountAcc]):
+    """Count the non-NULL values of a column, or the rows (``COUNT(*)``)."""
+
+    @override
+    def accumulator(self) -> _CountAcc:
+        return _CountAcc()
+
+
+class Sum(AggregateFunction[_SumAcc]):
+    """Add up the non-NULL values of a column; the sum of no values is NULL."""
+
+    @override
+    def accumulator(self) -> _SumAcc:
+        return _SumAcc()
+
+
+class Avg(AggregateFunction[_AvgAcc]):
+    """Average the non-NULL values of a column; the average of none is NULL."""
+
+    @override
+    def accumulator(self) -> _AvgAcc:
+        return _AvgAcc()
+
+
+class Min(AggregateFunction[_ExtremeAcc]):
+    """Find the smallest non-NULL value of a column."""
+
+    @override
+    def accumulator(self) -> _ExtremeAcc:
+        return _ExtremeAcc(largest=False)
+
+
+class Max(AggregateFunction[_ExtremeAcc]):
+    """Find the largest non-NULL value of a column."""
+
+    @override
+    def accumulator(self) -> _ExtremeAcc:
+        return _ExtremeAcc(largest=True)
 
 
 class Aggregate(Operator):
-    """γ: group rows by `group_by` columns and compute `aggregates` per group."""
+    """Group rows by ``group_by`` and compute ``aggregates`` for each group.
 
-    def __init__(self, child: Operator, group_by: list[str],
-                 aggregates: dict[str, AggregateFunction]):
+    This is hash aggregation: one dict entry per group. With no
+    ``group_by`` the whole input is one group, so an empty input still
+    produces one row.
+
+    :param child: the input.
+    :param group_by: the grouping columns.
+    :param aggregates: ``{output name: aggregate function}``.
+    """
+
+    def __init__(
+        self, child: Operator, group_by: list[str], aggregates: dict[str, AggregateFunction[Accumulator]]
+    ) -> None:
         self.children = (child,)
         self.group_by, self.aggregates = list(group_by), aggregates
 
-    def __iter__(self):
-        funcs = list(self.aggregates.values())
-        groups: dict[tuple, list] = {}                      # hash aggregation
-        for row in self.children[0]:                        # blocking
+    @override
+    def __iter__(self) -> Iterator[Row]:
+        groups: dict[tuple[Value | None, ...], list[Accumulator]] = {}
+        for row in self.children[0]:  # blocking
             key = tuple(row[c] for c in self.group_by)
-            states = groups.get(key)
-            if states is None:
-                states = groups[key] = [f.start() for f in funcs]
-            for i, f in enumerate(funcs):
-                value = row if f.column is None else row[f.column]
-                if value is not None:                       # aggregates skip NULLs
-                    states[i] = f.step(states[i], value)
-        if not groups and not self.group_by:                # aggregate of no rows
-            groups[()] = [f.start() for f in funcs]         # still yields one row
-        for key, states in groups.items():
-            out = Row(zip(self.group_by, key))
-            out.update((name, f.finish(s))
-                       for (name, f), s in zip(self.aggregates.items(), states))
+            if key not in groups:
+                groups[key] = self._fresh()
+            self._accumulate(groups[key], row)
+        if not groups and not self.group_by:  # aggregate of no rows
+            groups[()] = self._fresh()
+        for key, accs in groups.items():
+            out = Row(zip(self.group_by, key, strict=True))
+            out.update((name, acc.result()) for name, acc in zip(self.aggregates, accs, strict=True))
             yield out
 
-    def columns(self):
+    def _fresh(self) -> list[Accumulator]:
+        return [f.accumulator() for f in self.aggregates.values()]
+
+    def _accumulate(self, accs: list[Accumulator], row: Row) -> None:
+        """Fold one row into a group's accumulators; aggregates skip NULLs."""
+        for f, acc in zip(self.aggregates.values(), accs, strict=True):
+            value = True if f.column is None else row[f.column]  # COUNT(*) counts rows
+            if value is not None:
+                acc.add(value)
+
+    @override
+    def columns(self) -> list[str]:
         return self.group_by + list(self.aggregates)
 
     @property
-    def label(self):
+    @override
+    def label(self) -> str:
         aggs = ", ".join(f"{n}={f!r}" for n, f in self.aggregates.items())
         return f"Aggregate by {self.group_by or '()'}: {aggs}"
+```
+
+```python
+# src/minidb/operators.py (imports)
+from minidb.values import arithmetic
 ```
 
 This is **hash aggregation**: one dict entry per group. The alternative, *sort aggregation*, sorts by the group key and emits a group each time the key changes. It uses less memory, and its output comes out sorted. Real planners choose between the two.
@@ -357,117 +642,278 @@ londoners = adults.where(lambda r: r["city"] == "London")   # adults is unchange
 ```
 
 ```python
-# minidb/query.py (append)
+# src/minidb/query.py
+"""Provide a fluent, immutable query builder on top of the operators."""
+
+from dataclasses import dataclass
+from dataclasses import field
+from dataclasses import replace
+from typing import TYPE_CHECKING
+from typing import Protocol
+
+from minidb.operators import Aggregate
+from minidb.operators import Distinct
+from minidb.operators import Filter
+from minidb.operators import Limit
+from minidb.operators import NestedLoopJoin
+from minidb.operators import Project
+from minidb.operators import Scan
+from minidb.operators import Sort
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    from minidb.operators import Accumulator
+    from minidb.operators import AggregateFunction
+    from minidb.operators import JoinKind
+    from minidb.operators import Operator
+    from minidb.operators import Row
+    from minidb.operators import RowFunction
+    from minidb.operators import RowPredicate
+    from minidb.operators import SortKey
+    from minidb.operators import Source
+    from minidb.values import Value
+
+
+class QueryState(Protocol):
+    """Describe where a query finds its tables: a database, for now."""
+
+    def table(self, name: str) -> Source:
+        """Return the table (or view) called ``name``."""
+        ...
+
+
+@dataclass(frozen=True)
 class Query:
-    """Immutable, fluent query builder. Each method returns a new Query."""
+    """Build a query step by step; each method returns a new, extended query.
 
-    def __init__(self, db, table: str, alias: str | None = None):
-        self._db = db
-        self._from = (table, alias)
-        self._joins: tuple = ()
-        self._where: tuple = ()
-        self._group: tuple | None = None
-        self._aggregates: dict = {}
-        self._having: tuple = ()
-        self._order: tuple = ()
-        self._select: dict | None = None
-        self._distinct = False
-        self._limit: tuple | None = None
+    Nothing runs until the query is iterated, or :meth:`all`, :meth:`first`
+    or :meth:`explain` is called. The parts are assembled in the order SQL
+    evaluates them: FROM and JOIN, WHERE, GROUP BY, HAVING, ORDER BY,
+    SELECT, DISTINCT, LIMIT.
 
-    def _with(self, **changes) -> "Query":
-        q = object.__new__(Query)
-        q.__dict__ = self.__dict__ | {"_" + k: v for k, v in changes.items()}
-        return q
+    :param state: where the tables come from.
+    :param table: the first table, as in ``FROM table``.
+    :param alias: its alias; ``None`` (the default) uses the table's name.
+    """
 
-    # -- building -------------------------------------------------------------------
-    def join(self, table: str, on: Callable[[Row], Any], alias: str | None = None,
-             kind: str = "inner") -> "Query":
-        return self._with(joins=self._joins + ((table, alias, on, kind),))
+    state: QueryState
+    table: str
+    alias: str | None = None
+    joins: tuple[tuple[str, str | None, RowPredicate, JoinKind], ...] = ()
+    filters: tuple[RowPredicate, ...] = ()
+    grouping: tuple[str, ...] | None = None
+    aggregates: dict[str, AggregateFunction[Accumulator]] = field(default_factory=dict)
+    having_filters: tuple[RowPredicate, ...] = ()
+    ordering: tuple[SortKey, ...] = ()
+    outputs: dict[str, str | RowFunction] | None = None
+    is_distinct: bool = False
+    bounds: tuple[int | None, int] | None = None
 
-    def where(self, predicate: Callable[[Row], Any]) -> "Query":
-        return self._with(where=self._where + (predicate,))
+    # -- building ---------------------------------------------------------------
+    def join(self, table: str, on: RowPredicate, alias: str | None = None, kind: JoinKind = "inner") -> Query:
+        """Join another table.
 
-    def group_by(self, *columns: str, **aggregates: AggregateFunction) -> "Query":
-        return self._with(group=columns, aggregates=aggregates)
+        :param table: the table to join.
+        :param on: the join condition.
+        :param alias: its alias; ``None`` (the default) uses its name.
+        :param kind: ``"inner"`` (the default) or ``"left"``.
+        :return: the extended query.
+        """
+        return replace(self, joins=(*self.joins, (table, alias, on, kind)))
 
-    def having(self, predicate: Callable[[Row], Any]) -> "Query":
-        return self._with(having=self._having + (predicate,))
+    def where(self, predicate: RowPredicate) -> Query:
+        """Keep only rows for which ``predicate`` is true; calls combine with AND.
 
-    def order_by(self, *keys: str | Callable) -> "Query":
-        """'name' ascending, '-name' descending, or a function of the row."""
-        parsed = tuple((k[1:], True) if isinstance(k, str) and k.startswith("-")
-                       else (k, False) for k in keys)
-        return self._with(order=self._order + parsed)
+        :param predicate: a function of the row.
+        :return: the extended query.
+        """
+        return replace(self, filters=(*self.filters, predicate))
 
-    def select(self, *columns: str, **computed: str | Callable[[Row], Any]) -> "Query":
-        """select('u.name', total='o.total', double=lambda r: 2 * r['x'])"""
-        outputs = {c.rpartition(".")[2]: c for c in columns}
+    def group_by(self, *columns: str, **aggregates: AggregateFunction[Accumulator]) -> Query:
+        """Group rows by ``columns`` and compute ``aggregates`` for each group.
+
+        :param columns: the grouping columns; none for a single group.
+        :param aggregates: ``name=function`` for each output aggregate.
+        :return: the extended query.
+        """
+        return replace(self, grouping=columns, aggregates=aggregates)
+
+    def having(self, predicate: RowPredicate) -> Query:
+        """Keep only groups for which ``predicate`` is true.
+
+        :param predicate: a function of the aggregated row.
+        :return: the extended query.
+        """
+        return replace(self, having_filters=(*self.having_filters, predicate))
+
+    def order_by(self, *keys: str | RowFunction) -> Query:
+        """Sort the result; ``"name"`` ascends, ``"-name"`` descends.
+
+        :param keys: column names, optionally prefixed with ``-``, or
+            functions of the row, most significant first.
+        :return: the extended query.
+        """
+        parsed = tuple((k[1:], True) if isinstance(k, str) and k.startswith("-") else (k, False) for k in keys)
+        return replace(self, ordering=(*self.ordering, *parsed))
+
+    def select(self, *columns: str, **computed: str | RowFunction) -> Query:
+        """Choose the output columns.
+
+        ``select("u.name", total="o.total", double=lambda r: 2 * r["x"])``
+
+        :param columns: columns to output, under their unqualified names.
+        :param computed: ``name=column`` or ``name=function`` pairs.
+        :return: the extended query.
+        :raises ValueError: if two outputs would have the same name.
+        """
+        outputs: dict[str, str | RowFunction] = {c.rpartition(".")[2]: c for c in columns}
         if len(outputs) != len(columns):
             raise ValueError("duplicate output names; use keyword aliases")
-        return self._with(select=outputs | computed)
+        return replace(self, outputs=outputs | computed)
 
-    def distinct(self) -> "Query":
-        return self._with(distinct=True)
+    def distinct(self) -> Query:
+        """Drop duplicate result rows.
 
-    def limit(self, count: int | None, offset: int = 0) -> "Query":
-        return self._with(limit=(count, offset))
+        :return: the extended query.
+        """
+        return replace(self, is_distinct=True)
 
-    # -- planning -------------------------------------------------------------------
+    def limit(self, count: int | None, offset: int = 0) -> Query:
+        """Return at most ``count`` rows, after skipping ``offset``.
+
+        :param count: the maximum number of rows, or ``None`` for no limit.
+        :param offset: the rows to skip first; 0 by default.
+        :return: the extended query.
+        """
+        return replace(self, bounds=(count, offset))
+
+    # -- planning ---------------------------------------------------------------
     def plan(self) -> Operator:
-        table, alias = self._from
-        op: Operator = Scan(self._db.table(table), alias)
-        for jtable, jalias, on, kind in self._joins:
-            op = NestedLoopJoin(op, Scan(self._db.table(jtable), jalias), on, kind)
-        for predicate in self._where:
+        """Assemble the operator tree, in SQL's order of evaluation.
+
+        :return: the root operator.
+        """
+        op: Operator = Scan(self.state.table(self.table), self.alias)
+        for jtable, jalias, on, kind in self.joins:
+            op = NestedLoopJoin(op, Scan(self.state.table(jtable), jalias), on, kind)
+        for predicate in self.filters:
             op = Filter(op, predicate)
-        if self._group is not None:
-            op = Aggregate(op, list(self._group), self._aggregates)
-        for predicate in self._having:
+        if self.grouping is not None:
+            op = Aggregate(op, list(self.grouping), self.aggregates)
+        for predicate in self.having_filters:
             op = Filter(op, predicate)
-        if self._order:
-            op = Sort(op, list(self._order))
-        if self._select is not None:
-            op = Project(op, self._select)
-        if self._distinct:
+        return self._finish(op)
+
+    def _finish(self, op: Operator) -> Operator:
+        """Add ORDER BY, SELECT, DISTINCT and LIMIT on top of ``op``."""
+        if self.ordering:
+            op = Sort(op, list(self.ordering))
+        if self.outputs is not None:
+            op = Project(op, self.outputs)
+        if self.is_distinct:
             op = Distinct(op)
-        if self._limit is not None:
-            op = Limit(op, *self._limit)
+        if self.bounds is not None:
+            op = Limit(op, *self.bounds)
         return op
 
-    # -- running --------------------------------------------------------------------
+    # -- running ----------------------------------------------------------------
     def __iter__(self) -> Iterator[Row]:
         return iter(self.plan())
 
-    def all(self) -> list[dict]:
+    def all(self) -> list[dict[str, Value | None]]:
+        """Run the query and return every row, as a plain dict.
+
+        :return: the result rows.
+        """
         return [dict(row) for row in self.plan()]
 
-    def first(self) -> dict | None:
+    def first(self) -> dict[str, Value | None] | None:
+        """Run the query and return its first row.
+
+        :return: the first row, or ``None`` if there are no rows.
+        """
         return next((dict(row) for row in self.limit(1).plan()), None)
 
     def explain(self) -> str:
+        """Describe the plan, one operator per line.
+
+        :return: the description.
+        """
         return self.plan().explain()
 ```
 
-`_with` is a small trick worth knowing. It creates a `Query` *without* calling `__init__` and gives it a copy of the old instance dict with some fields replaced. All the fields are tuples or dicts that are never mutated after creation, so sharing them between queries is safe.
+`Query` is a frozen dataclass, and each method returns `dataclasses.replace(self, …)`: a copy with some fields changed. The fields are tuples, or dicts that are never mutated after creation, so sharing them between queries is safe. `Query` finds its tables through `QueryState`, a protocol with a single method, `table(name)`. The `Database` satisfies it today; in [Chapter 9](09-unit-of-work-ii.md) a transaction will too.
 
 Hook it into the database:
 
 ```python
-# minidb/database.py (add to Database)
+# src/minidb/database.py (add to Database)
     def query(self, table: str, alias: str | None = None) -> Query:
-        """Start a query: db.query('users', 'u').where(...).all()"""
+        """Start a query on ``table``.
+
+        >>> from minidb.schema import Column
+        >>> from minidb.types import Integer
+        >>> db = Database()
+        >>> _ = db.create_table("t", [Column("n", Integer())])
+        >>> for n in (3, 1, 2):
+        ...     _ = db.insert("t", {"n": n})
+        >>> [row["n"] for row in db.query("t").order_by("-n")]
+        [3, 2, 1]
+
+        :param table: the first table.
+        :param alias: its alias; ``None`` (the default) uses its name.
+        :return: a query to extend and run.
+        """
         return Query(self, table, alias)
 ```
 
 ```python
-# minidb/database.py (imports)
+# src/minidb/database.py (imports)
 from minidb.query import Query
 ```
 
 ```python
-# minidb/__init__.py (append)
-from minidb.query import Avg, Count, Max, Min, Query, Sum
-__all__ += ["Query", "Count", "Sum", "Avg", "Min", "Max"]
+# src/minidb/__init__.py (replace __all__)
+__all__ = [
+    "Avg",
+    "Boolean",
+    "Check",
+    "CheckError",
+    "Column",
+    "ConstraintError",
+    "Count",
+    "Database",
+    "DatabaseError",
+    "Date",
+    "DomainError",
+    "ForeignKey",
+    "ForeignKeyError",
+    "Integer",
+    "Max",
+    "Min",
+    "NotNullError",
+    "Numeric",
+    "Query",
+    "Real",
+    "SchemaError",
+    "Sum",
+    "TableSchema",
+    "Text",
+    "Timestamp",
+    "UniqueError",
+    "normalizers",
+]
+```
+
+```python
+# src/minidb/__init__.py (imports)
+from minidb.operators import Avg
+from minidb.operators import Count
+from minidb.operators import Max
+from minidb.operators import Min
+from minidb.operators import Sum
+from minidb.query import Query
 ```
 
 ## 7.6 Trying it out
@@ -562,6 +1008,8 @@ There's a more immediate problem. A query iterates over live table dicts. A writ
 6. Our `Avg` divides an `int` sum by an `int` count and returns a `float`. SQL engines disagree here: some return an integer, PostgreSQL returns `numeric`. What should `Avg` of a `Numeric` column return? Make it so.
 7. Implement `kind="right"` and `kind="full"` joins. Why does a full outer join need to remember which right rows matched?
 8. *(Thought experiment)* A query scans `users` while another thread deletes from it. List every way the result could be wrong or crash. Keep the list for [Chapter 10](10-concurrency-i.md).
+
+*Answers: [Appendix D, Chapter 7](appendix-d-answers.md#chapter-7--query-primitives).*
 
 ---
 

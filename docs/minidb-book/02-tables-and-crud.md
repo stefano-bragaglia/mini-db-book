@@ -35,16 +35,20 @@ classDiagram
 A database spends much of its time saying *no*, so we start with the exceptions. Every error minidb raises deliberately derives from `DatabaseError`. That way an application can catch "anything the database rejected" without also catching its own bugs.
 
 ```python
-# minidb/errors.py
-"""Exceptions raised by minidb."""
+# src/minidb/errors.py
+"""Define the exceptions that minidb raises on purpose."""
 
 
 class DatabaseError(Exception):
-    """Base class for every error minidb raises on purpose."""
+    """Signal any error that minidb raises deliberately.
+
+    Catching it catches everything the database rejected, but none of the
+    application's own bugs.
+    """
 
 
 class SchemaError(DatabaseError):
-    """A table or column does not exist, or a definition is invalid."""
+    """Signal that a table or column doesn't exist, or a definition is invalid."""
 ```
 
 ## 2.2 Rows and rowids
@@ -68,22 +72,58 @@ Rowid 3 is missing because its row was deleted. The counter never hands out 3 ag
 
 ## 2.3 The `Table` class
 
+What is a row? For now, a dict from column names to anything. We give that a name in a module of its own, because nearly every other module will need it:
+
 ```python
-# minidb/table.py
-"""In-memory storage for one table."""
-from collections.abc import Callable, Iterator, Mapping
+# src/minidb/values.py
+"""Name the types of the values that tables hold."""
+
+type Row = dict[str, object]
+```
+
+```python
+# src/minidb/table.py
+"""Store the rows of one table in memory.
+
+Rows live in a dict keyed by a hidden *rowid*: an integer from a counter that
+only goes up, so a rowid is never reused, even after its row is deleted.
+"""
+
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
 from minidb.errors import SchemaError
 
-type Row = dict[str, object]
-type Predicate = Callable[[Mapping[str, object]], bool]
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
+    from collections.abc import Mapping
+    from collections.abc import Sequence
+
+    from minidb.values import Row
+
+type Predicate = Callable[[Mapping[str, object]], object]
+type Where = Predicate | None
 
 
 class Table:
-    """Rows stored by a hidden, never-reused integer rowid."""
+    """Hold the rows of one table, keyed by a hidden, never-reused rowid.
 
-    def __init__(self, name: str, columns: list[str]):
+    Rows are *values*: the table hands out copies, and replaces stored rows
+    instead of mutating them, so no caller can change a row behind its back.
+
+    >>> users = Table("users", ["id", "name"])
+    >>> users.insert({"id": 1, "name": "Ada"})
+    1
+    >>> users.select(lambda row: row["id"] == 1)
+    [{'id': 1, 'name': 'Ada'}]
+
+    :param name: the table's name.
+    :param columns: the column names, in order.
+    :raises SchemaError: if a column name appears twice.
+    """
+
+    def __init__(self, name: str, columns: Sequence[str]) -> None:
         if len(set(columns)) != len(columns):
             raise SchemaError(f"duplicate column names in {name!r}")
         self.name = name
@@ -95,9 +135,17 @@ class Table:
         return len(self.rows)
 
     # -- create ---------------------------------------------------------
-    def insert(self, values: Row) -> int:
+    def insert(self, values: Mapping[str, object]) -> int:
+        """Add a row and return its rowid.
+
+        Columns missing from ``values`` are stored as ``None``.
+
+        :param values: the new row's values, by column name.
+        :return: the rowid of the new row.
+        :raises SchemaError: if ``values`` names an unknown column.
+        """
         self._check_columns(values)
-        row = {c: values.get(c) for c in self.columns}   # missing -> None
+        row = {c: values.get(c) for c in self.columns}
         rowid = self._next_rowid
         self._next_rowid += 1
         self.rows[rowid] = row
@@ -105,47 +153,90 @@ class Table:
 
     # -- read -----------------------------------------------------------
     def get(self, rowid: int) -> Row | None:
+        """Return a copy of the row with ``rowid``.
+
+        :param rowid: the row to fetch.
+        :return: a copy of the row, or ``None`` if there is no such row.
+        """
         row = self.rows.get(rowid)
         return dict(row) if row is not None else None
 
     def scan(self) -> Iterator[tuple[int, Row]]:
+        """Yield every ``(rowid, row)`` pair, each row a fresh copy.
+
+        :return: an iterator over the table, in insertion order.
+        """
         for rowid, row in self.rows.items():
             yield rowid, dict(row)
 
-    def match(self, where: Predicate | None = None) -> list[int]:
-        """Rowids of the rows satisfying `where` (all rows if None)."""
+    def match(self, where: Where = None) -> list[int]:
+        """Return the rowids of the rows that satisfy ``where``.
+
+        The predicate sees each row through a read-only view, so it can't
+        change the stored row.
+
+        :param where: decides which rows match; ``None`` (the default)
+            matches every row.
+        :return: the matching rowids.
+        """
         if where is None:
             return list(self.rows)
-        return [rid for rid, row in self.rows.items()
-                if where(MappingProxyType(row))]
+        return [rid for rid, row in self.rows.items() if where(MappingProxyType(row))]
 
-    def select(self, where: Predicate | None = None) -> list[Row]:
+    def select(self, where: Where = None) -> list[Row]:
+        """Return copies of the rows that satisfy ``where``.
+
+        :param where: decides which rows match; ``None`` (the default)
+            matches every row.
+        :return: the matching rows.
+        """
         return [dict(self.rows[rid]) for rid in self.match(where)]
 
     # -- update ---------------------------------------------------------
-    def update(self, changes: Row, where: Predicate | None = None) -> int:
+    def update(self, changes: Mapping[str, object], where: Where = None) -> int:
+        """Set the columns in ``changes`` on every row that satisfies ``where``.
+
+        The matching rows are decided before any of them changes.
+
+        :param changes: the new values, by column name.
+        :param where: decides which rows change; ``None`` (the default)
+            changes every row.
+        :return: the number of rows changed.
+        :raises SchemaError: if ``changes`` names an unknown column.
+        """
         self._check_columns(changes)
-        targets = self.match(where)              # 1. decide
-        for rowid in targets:                    # 2. modify
-            self.rows[rowid] = self.rows[rowid] | changes
+        targets = self.match(where)  # 1. decide
+        for rowid in targets:  # 2. modify
+            self.rows[rowid] = self.rows[rowid] | dict(changes)
         return len(targets)
 
     # -- delete ---------------------------------------------------------
-    def delete(self, where: Predicate | None = None) -> int:
+    def delete(self, where: Where = None) -> int:
+        """Remove every row that satisfies ``where``.
+
+        :param where: decides which rows go; ``None`` (the default) removes
+            every row.
+        :return: the number of rows removed.
+        """
         targets = self.match(where)
         for rowid in targets:
             del self.rows[rowid]
         return len(targets)
 
     # -- helpers --------------------------------------------------------
-    def _check_columns(self, values: Row) -> None:
+    def _check_columns(self, values: Mapping[str, object]) -> None:
         unknown = set(values) - set(self.columns)
         if unknown:
-            raise SchemaError(
-                f"{self.name}: unknown column(s) {', '.join(sorted(unknown))}")
+            raise SchemaError(f"{self.name}: unknown column(s) {', '.join(sorted(unknown))}")
 ```
 
 A few details deserve a closer look.
+
+### Imports for the type checker
+
+Some names, such as `Callable`, `Mapping` and `Row`, appear only in annotations. They're imported inside `if TYPE_CHECKING:`, a block the type checker reads and the interpreter skips. Python 3.14 evaluates annotations lazily (PEP 649), so annotations can mention those names freely, and at run time the module imports only what it actually uses. This keeps import cycles away, which matters later when modules start referring to each other's types. Ruff's `TC` rules enforce the split.
+
+`type Predicate = …` is a *type alias* (Python 3.12+ syntax). Its value is also evaluated lazily, only if someone asks for it. A predicate may return anything: only its truth value is used. That leaves room for predicates that answer `None` for "unknown", which [Chapter 4](04-constraints.md) needs.
 
 ### Copies out, never references
 
@@ -199,48 +290,113 @@ Second, and more interesting, is the **Halloween problem**. IBM's System R team 
 Applications talk to a `Database`, which looks up tables by name and forwards CRUD calls. It's thin now; later it will be where cross-table rules (foreign keys), transactions and locking live.
 
 ```python
-# minidb/database.py
-"""The public entry point: a collection of tables with CRUD operations."""
+# src/minidb/database.py
+"""Provide the public entry point: a collection of tables with CRUD operations."""
+
+from typing import TYPE_CHECKING
+
 from minidb.errors import SchemaError
-from minidb.table import Predicate, Row, Table
+from minidb.table import Table
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from collections.abc import Sequence
+
+    from minidb.table import Where
+    from minidb.values import Row
 
 
 class Database:
-    def __init__(self):
+    """Hold tables by name, and run CRUD operations on them."""
+
+    def __init__(self) -> None:
         self.tables: dict[str, Table] = {}
 
     # -- schema -----------------------------------------------------------
-    def create_table(self, name: str, columns: list[str]) -> Table:
+    def create_table(self, name: str, columns: Sequence[str]) -> Table:
+        """Create an empty table and return it.
+
+        >>> db = Database()
+        >>> db.create_table("users", ["id", "name"]).columns
+        ('id', 'name')
+
+        :param name: the new table's name.
+        :param columns: its column names, in order.
+        :return: the new table.
+        :raises SchemaError: if the table already exists, or a column name
+            appears twice.
+        """
         if name in self.tables:
             raise SchemaError(f"table {name!r} already exists")
         table = self.tables[name] = Table(name, columns)
         return table
 
     def drop_table(self, name: str) -> None:
-        self.table(name)                      # raises if missing
+        """Delete a table and all its rows.
+
+        :param name: the table to delete.
+        :raises SchemaError: if there is no such table.
+        """
+        self.table(name)  # raises if missing
         del self.tables[name]
 
     def table(self, name: str) -> Table:
+        """Return the table called ``name``.
+
+        :param name: the table's name.
+        :return: the table.
+        :raises SchemaError: if there is no such table.
+        """
         try:
             return self.tables[name]
         except KeyError:
             raise SchemaError(f"no such table: {name!r}") from None
 
     # -- CRUD -------------------------------------------------------------
-    def insert(self, table: str, values: Row) -> int:
+    def insert(self, table: str, values: Mapping[str, object]) -> int:
+        """Insert a row into ``table``; see :meth:`Table.insert`.
+
+        :param table: the table's name.
+        :param values: the new row's values, by column name.
+        :return: the rowid of the new row.
+        """
         return self.table(table).insert(values)
 
     def get(self, table: str, rowid: int) -> Row | None:
+        """Return a copy of one row; see :meth:`Table.get`.
+
+        :param table: the table's name.
+        :param rowid: the row to fetch.
+        :return: the row, or ``None`` if there is no such row.
+        """
         return self.table(table).get(rowid)
 
-    def select(self, table: str, where: Predicate | None = None) -> list[Row]:
+    def select(self, table: str, where: Where = None) -> list[Row]:
+        """Return the rows of ``table`` that satisfy ``where``.
+
+        :param table: the table's name.
+        :param where: decides which rows match; ``None`` matches all.
+        :return: copies of the matching rows.
+        """
         return self.table(table).select(where)
 
-    def update(self, table: str, changes: Row,
-               where: Predicate | None = None) -> int:
+    def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
+        """Update the rows of ``table`` that satisfy ``where``.
+
+        :param table: the table's name.
+        :param changes: the new values, by column name.
+        :param where: decides which rows change; ``None`` changes all.
+        :return: the number of rows changed.
+        """
         return self.table(table).update(changes, where)
 
-    def delete(self, table: str, where: Predicate | None = None) -> int:
+    def delete(self, table: str, where: Where = None) -> int:
+        """Delete the rows of ``table`` that satisfy ``where``.
+
+        :param table: the table's name.
+        :param where: decides which rows go; ``None`` deletes all.
+        :return: the number of rows deleted.
+        """
         return self.table(table).delete(where)
 ```
 
@@ -249,10 +405,12 @@ The `from None` in `table()` hides the internal `KeyError` from the traceback. T
 Finally, make the package export its main class:
 
 ```python
-# minidb/__init__.py
-"""minidb: a small relational database, built in the book."""
+# src/minidb/__init__.py
+"""Build a small relational database, one chapter at a time."""
+
 from minidb.database import Database
-from minidb.errors import DatabaseError, SchemaError
+from minidb.errors import DatabaseError
+from minidb.errors import SchemaError
 
 __all__ = ["Database", "DatabaseError", "SchemaError"]
 ```
@@ -307,6 +465,8 @@ We have a CRUD API whose shape will survive to the end of the book. But we can s
 5. **The Halloween problem.** Write a version of `update` that modifies rows *while* iterating over a copy of `self.rows.items()`. Does it suffer from the Halloween problem? Why not? Now imagine the iteration followed a structure kept sorted by the updated column. What would happen?
 6. `scan()` is a generator. What happens if the caller inserts into the same table while consuming it? Try it. Should `scan` take a snapshot of `self.rows` first? What does that cost?
 7. *(Design)* Our predicates are opaque Python callables. Name one thing a database could do if predicates were *data* (e.g. `("age", ">", 40)`) instead. ([Chapter 14](14-query-planning.md) does exactly this.)
+
+*Answers: [Appendix D, Chapter 2](appendix-d-answers.md#chapter-2--tables-and-crud).*
 
 ---
 

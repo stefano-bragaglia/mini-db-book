@@ -2,7 +2,7 @@
 
 # Appendix B — Testing a Database
 
-Databases are hard to test. The bugs that matter only show up after a particular sequence of operations, under a particular thread interleaving, or after a crash at a particular byte. Example-based tests ("insert Ada, select Ada") are necessary but nowhere near sufficient. This appendix shows five kinds of test that work much better for systems like minidb, all written with the standard library's `unittest`:
+Databases are hard to test. The bugs that matter only show up after a particular sequence of operations, under a particular thread interleaving, or after a crash at a particular byte. Example-based tests ("insert Ada, select Ada") are necessary but nowhere near sufficient. This appendix shows five kinds of test that work much better for systems like minidb, all written with the standard library's `unittest`. The tests use plain `assert` statements and a three-line `expect()` context manager rather than `self.assertEqual` and `self.assertRaises`: ruff's pytest-style rules prefer bare asserts, and they read better anyway.
 
 | Kind | Idea | Finds |
 |---|---|---|
@@ -60,216 +60,296 @@ The test records the database state after each commit, then checks that the reco
 
 ```python
 # tests/test_minidb.py
-"""Tests for minidb: unit, property-based, model-based, concurrency and crash tests."""
-import os
+"""Test minidb: unit, property-based, model-based, concurrency and crash tests."""
+
 import random
 import shutil
 import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from minidb import *
-from minidb.btree import BPlusTree, BTreeIndex
-from minidb.index import SortedIndex
+from minidb import CheckError
+from minidb import Column
+from minidb import Database
+from minidb import Date
+from minidb import DomainError
+from minidb import Integer
+from minidb import Numeric
+from minidb import Real
+from minidb import Storage
+from minidb import Text
+from minidb import Timestamp
+from minidb import UniqueError
+from minidb import UnitOfWork
+from minidb.btree import BPlusTree
 from minidb.locks import FairRWLock
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
+
+    from minidb.index import Index
+    from minidb.schema import ForeignKey
+    from minidb.table import Table
+    from minidb.values import Row
+
+
+@contextmanager
+def expect(error: type[BaseException], context: str = "") -> Iterator[None]:
+    """Fail unless the block raises ``error``."""
+    try:
+        yield
+    except error:
+        return
+    raise AssertionError(f"{error.__name__} not raised {context}")
 
 
 # -- an integrity checker: the invariants every test can assert ------------------------------
-def index_entries(index) -> int:
-    if isinstance(index, BTreeIndex):
-        return sum(len(rowids) for _, rowids in index.tree.items())
-    if isinstance(index, SortedIndex):
-        return len(index._sorted)
-    return sum(len(rowids) for rowids in index._entries.values())
-
-
 def check_integrity(db: Database) -> None:
     """Raise AssertionError if any index, key or reference is inconsistent."""
     for t in db.tables.values():
         for index in t.indexes.values():
-            keyed = 0
-            for rowid, row in t.rows.items():
-                key = index.key_of(row)
-                if key is None:
-                    continue
-                keyed += 1
-                found = index.lookup(key)
-                assert rowid in found, f"{t.name}.{index.name}: row {rowid} missing"
-                assert not index.unique or len(found) == 1, f"{index.name}: duplicate {key}"
-            assert keyed == index_entries(index), f"{t.name}.{index.name}: stale entries"
+            _check_index(t, index)
         for row in t.rows.values():
-            t.schema.prepare_row({}, base=row)          # re-runs NOT NULL and CHECKs
+            t.schema.prepare_row({}, base=row)  # re-runs NOT NULL and CHECKs
     for fk in db.foreign_keys:
-        parent = db.tables[fk.ref_table]
-        for row in db.tables[fk.table].rows.values():
-            key = fk.parent_key(row)
-            assert key is None or parent.lookup(key), f"{fk.name}: orphan {row}"
+        _check_references(db, fk)
+
+
+def _check_index(t: Table, index: Index) -> None:
+    """Rebuild the index's expected contents from the rows, and compare."""
+    expected: dict[tuple[object, ...], set[int]] = {}
+    for rowid, row in t.rows.items():
+        key = index.key_of(row)
+        if key is not None:
+            expected.setdefault(key, set()).add(rowid)
+    assert index.distinct_keys() == len(expected), f"{t.name}.{index.name}: stale keys"
+    for key, rowids in expected.items():
+        assert index.lookup(key) == rowids, f"{t.name}.{index.name}: wrong rows for {key}"
+        assert not index.unique or len(rowids) == 1, f"{index.name}: duplicate {key}"
+
+
+def _check_references(db: Database, fk: ForeignKey) -> None:
+    parent = db.tables[fk.ref_table]
+    for row in db.tables[fk.table].rows.values():
+        key = fk.parent_key(row)
+        assert key is None or parent.lookup(key), f"{fk.name}: orphan {row}"
 
 
 # -- unit tests -----------------------------------------------------------------------------
 class TypeTests(unittest.TestCase):
-    def test_integer_rejects_bool(self):
-        with self.assertRaises(DomainError):
-            Integer().normalize(True)
+    def test_integer_rejects_bool(self) -> None:
+        with expect(DomainError):
+            Integer().normalize(True)  # noqa: FBT003 - the point of the test
 
-    def test_numeric_rounds_half_even(self):
-        self.assertEqual(str(Numeric(6, 2).normalize("2.665")), "2.66")
+    def test_numeric_rounds_half_even(self) -> None:
+        assert str(Numeric(6, 2).normalize("2.665")) == "2.66"
 
-    def test_round_trip_through_primitives(self):
-        for t, v in [(Numeric(8, 2), "12.30"), (Date(), "2026-11-18"),
-                     (Timestamp(), "2026-11-18T10:00:00+00:00"), (Real(), 0.1)]:
-            value = t.normalize(v)
-            self.assertEqual(t.from_primitive(t.to_primitive(value)), value)
+    def test_round_trip_through_primitives(self) -> None:
+        for t, raw in [
+            (Numeric(8, 2), "12.30"),
+            (Date(), "2026-11-18"),
+            (Timestamp(), "2026-11-18T10:00:00+00:00"),
+            (Real(), 0.1),
+        ]:
+            value = t.normalize(raw)
+            assert t.from_primitive(t.to_primitive(value)) == value
 
 
 # -- property-based: compare a data structure with a trivially correct model -----------------
+def _btree_step(rnd: random.Random, tree: BPlusTree[int, int], model: dict[int, set[int]]) -> None:
+    k, v = rnd.randrange(500), rnd.randrange(4)
+    if rnd.random() < 0.6:
+        tree.insert(k, v)
+        model.setdefault(k, set()).add(v)
+        return
+    tree.remove(k, v)
+    if v in model.get(k, set()):
+        model[k].discard(v)
+        if not model[k]:
+            del model[k]
+
+
 class BTreeProperties(unittest.TestCase):
-    def test_matches_a_dict(self):
+    def test_matches_a_dict(self) -> None:
         for order in (3, 4, 7, 32):
-            rnd, tree, model = random.Random(order), BPlusTree(order), {}
+            rnd = random.Random(order)  # noqa: S311 - test data
+            tree, model = BPlusTree[int, int](order), dict[int, set[int]]()
             for _ in range(5000):
-                k, v = rnd.randrange(500), rnd.randrange(4)
-                if rnd.random() < 0.6:
-                    tree.insert(k, v)
-                    model.setdefault(k, set()).add(v)
-                else:
-                    tree.remove(k, v)
-                    if v in model.get(k, ()):
-                        model[k].discard(v)
-                        if not model[k]:
-                            del model[k]
-            self.assertEqual([(k, s) for k, s in tree.items()], sorted(model.items()))
-            lo, hi = 100, 300
-            self.assertEqual([k for k, _ in tree.items(lo, hi, False, True)],
-                             [k for k in sorted(model) if lo < k <= hi])
+                _btree_step(rnd, tree, model)
+            assert list(tree.items()) == sorted(model.items())
+            assert [k for k, _ in tree.items(100, 300, lo_inclusive=False)] == [
+                k for k in sorted(model) if 100 < k <= 300
+            ]
 
 
 # -- model-based: random operations on minidb and on a dict, compared after each step ----------
+class UsersModel:
+    """Predict, with a plain dict, what minidb should do with a ``users`` table."""
+
+    def __init__(self) -> None:
+        self.rows: dict[int, Row] = {}
+
+    def insert(self, row: Row) -> type[Exception] | None:
+        if int(row["age"] or 0) < 0:
+            return CheckError
+        if row["id"] in self.rows or any(r["email"] == row["email"] for r in self.rows.values()):
+            return UniqueError
+        self.rows[int(row["id"] or 0)] = row
+        return None
+
+    def update(self, row: Row) -> type[Exception] | None:
+        uid = int(row["id"] or 0)
+        if uid not in self.rows:
+            return None
+        if int(row["age"] or 0) < 0:
+            return CheckError
+        if any(r["email"] == row["email"] and i != uid for i, r in self.rows.items()):
+            return UniqueError
+        self.rows[uid] = self.rows[uid] | row
+        return None
+
+    def delete(self, row: Row) -> type[Exception] | None:
+        self.rows.pop(int(row["id"] or 0), None)
+        return None
+
+
+def _users_db() -> Database:
+    db = Database()
+    db.create_table(
+        "users",
+        [Column("id", Integer()), Column("email", Text()), Column("age", Integer(), check=lambda a: int(a) >= 0)],
+        primary_key="id",
+        unique=["email"],
+    )
+    db.create_index("users", "by_age", ["age"], kind="btree")
+    return db
+
+
+def _actions(db: Database, row: Row) -> dict[str, Callable[[], object]]:
+    changes = {"email": row["email"], "age": row["age"]}
+    return {
+        "insert": lambda: db.insert("users", row),
+        "update": lambda: db.update("users", changes, {"id": row["id"]}),
+        "delete": lambda: db.delete("users", {"id": row["id"]}),
+    }
+
+
 class ModelBasedTest(unittest.TestCase):
-    def test_random_operations(self):
-        rnd = random.Random(42)
-        db = Database()
-        db.create_table("users", [Column("id", Integer()), Column("email", Text()),
-                                  Column("age", Integer(), check=lambda a: a >= 0)],
-                        primary_key="id", unique=["email"])
-        db.create_index("users", "by_age", ["age"], kind="btree")
-        model: dict[int, dict] = {}
+    def test_random_operations(self) -> None:
+        rnd = random.Random(42)  # noqa: S311 - test data
+        db, model = _users_db(), UsersModel()
+        predict = {"insert": model.insert, "update": model.update, "delete": model.delete}
         for step in range(1500):
-            uid, email, age = rnd.randrange(60), f"u{rnd.randrange(60)}@x", rnd.randrange(-3, 90)
-            op = rnd.choice(["insert", "update", "delete"])
-            row = {"id": uid, "email": email, "age": age}
-            if op == "insert":
-                if age < 0:
-                    expected = CheckViolation
-                elif uid in model or any(r["email"] == email for r in model.values()):
-                    expected = UniqueViolation
-                else:
-                    expected, model[uid] = None, row
-                action = lambda: db.insert("users", row)
-            elif op == "update":
-                taken = any(r["email"] == email and i != uid for i, r in model.items())
-                if uid in model and age < 0:
-                    expected = CheckViolation
-                elif uid in model and taken:
-                    expected = UniqueViolation
-                else:
-                    expected = None
-                    if uid in model:
-                        model[uid] = model[uid] | {"email": email, "age": age}
-                action = lambda: db.update("users", {"email": email, "age": age}, {"id": uid})
-            else:
-                expected = None
-                model.pop(uid, None)
-                action = lambda: db.delete("users", {"id": uid})
+            row: Row = {"id": rnd.randrange(60), "email": f"u{rnd.randrange(60)}@x", "age": rnd.randrange(-3, 90)}
+            op = rnd.choice(list(predict))
+            expected = predict[op](row)
             if expected is None:
-                action()
+                _actions(db, row)[op]()
             else:
-                with self.assertRaises(expected, msg=f"step {step}: {op} {row}"):
-                    action()
+                with expect(expected, f"at step {step}: {op} {row}"):
+                    _actions(db, row)[op]()
             if step % 50 == 0:
                 check_integrity(db)
-        self.assertEqual(sorted(db.select("users"), key=lambda r: r["id"]),
-                         [model[k] for k in sorted(model)])
+        assert sorted(db.select("users"), key=lambda r: int(r["id"] or 0)) == [
+            model.rows[k] for k in sorted(model.rows)
+        ]
         check_integrity(db)
 
 
 # -- concurrency: invariants, fairness ----------------------------------------------------------
+def _move(uow: UnitOfWork, a: int, b: int) -> None:
+    src, dst = uow.find("acct", {"id": a})[0], uow.find("acct", {"id": b})[0]
+    if int(src["bal"] or 0) >= 10:
+        src["bal"] = int(src["bal"] or 0) - 10
+        dst["bal"] = int(dst["bal"] or 0) + 10
+
+
+def _transfers(db: Database, seed: int) -> None:
+    rnd = random.Random(seed)  # noqa: S311 - test data
+    for _ in range(100):
+        a, b = rnd.sample(range(5), 2)
+        db.transaction(lambda uow, a=a, b=b: _move(uow, a, b))
+
+
+def _reader(lock: FairRWLock, stop: threading.Event, offset: float) -> None:
+    time.sleep(offset)
+    while not stop.is_set():
+        with lock.read():
+            time.sleep(0.005)
+
+
 class ConcurrencyTests(unittest.TestCase):
-    def test_transfers_preserve_total(self):
+    def test_transfers_preserve_total(self) -> None:
         db = Database()
-        db.create_table("acct", [Column("id", Integer()), Column("bal", Integer(min=0))],
-                        primary_key="id")
+        db.create_table("acct", [Column("id", Integer()), Column("bal", Integer(min=0))], primary_key="id")
         for i in range(5):
             db.insert("acct", {"id": i, "bal": 100})
-
-        def worker(seed):
-            rnd = random.Random(seed)
-            for _ in range(100):
-                a, b = rnd.sample(range(5), 2)
-                def move(uow):
-                    src, dst = uow.find("acct", {"id": a})[0], uow.find("acct", {"id": b})[0]
-                    if src["bal"] >= 10:
-                        src["bal"] -= 10
-                        dst["bal"] += 10
-                db.transaction(move)
-
-        threads = [threading.Thread(target=worker, args=(s,)) for s in range(6)]
-        for t in threads: t.start()
-        for t in threads: t.join()
-        self.assertEqual(sum(r["bal"] for r in db.select("acct")), 500)
+        threads = [threading.Thread(target=_transfers, args=(db, s)) for s in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sum(int(r["bal"] or 0) for r in db.select("acct")) == 500
         check_integrity(db)
 
-    def test_fair_lock_bounds_writer_wait(self):
-        lock, stop, waited = FairRWLock(), threading.Event(), []
-
-        def reader(offset):
-            time.sleep(offset)
-            while not stop.is_set():
-                with lock.read():
-                    time.sleep(0.005)
-
-        readers = [threading.Thread(target=reader, args=(i * 0.002,)) for i in range(4)]
-        for r in readers: r.start()
+    def test_fair_lock_bounds_writer_wait(self) -> None:
+        lock, stop = FairRWLock(), threading.Event()
+        readers = [threading.Thread(target=_reader, args=(lock, stop, i * 0.002)) for i in range(4)]
+        for r in readers:
+            r.start()
         time.sleep(0.05)
         t0 = time.perf_counter()
         with lock.write():
-            waited.append(time.perf_counter() - t0)
+            waited = time.perf_counter() - t0
         stop.set()
-        for r in readers: r.join()
-        self.assertLess(waited[0], 0.1)       # a reader-preferring lock waits until stop
+        for r in readers:
+            r.join()
+        assert waited < 0.1  # a reader-preferring lock would wait until stop
 
 
 # -- crash recovery: every possible torn write recovers to a prefix of the commits --------------
+def _open(path: str) -> Database:
+    db = Database()
+    db.create_table("t", [Column("id", Integer()), Column("v", Text())], primary_key="id")
+    db.attach(Storage(path, sync=False))
+    return db
+
+
+def _ids(db: Database) -> list[int]:
+    return sorted(int(r["id"] or 0) for r in db.select("t"))
+
+
+def _write_history(folder: str) -> list[list[int]]:
+    """Make twelve commits, and return the table's ids after each one."""
+    db = _open(folder)
+    states = [_ids(db)]
+    for i in range(12):
+        if i % 4 == 3:
+            db.delete("t", {"id": i - 2})
+        else:
+            db.insert("t", {"id": i, "v": "x" * i})
+        states.append(_ids(db))
+    db.close()
+    return states
+
+
 class CrashTests(unittest.TestCase):
-    def test_every_truncation_recovers_a_prefix(self):
+    def test_every_truncation_recovers_a_prefix(self) -> None:
         folder = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, folder)
-
-        def open_db(path):
-            db = Database()
-            db.create_table("t", [Column("id", Integer()), Column("v", Text())], primary_key="id")
-            db.attach(Storage(path, sync=False))
-            return db
-
-        db = open_db(folder)
-        states = [[]]                                      # state after each commit
-        for i in range(12):
-            if i % 4 == 3:
-                db.delete("t", {"id": i - 2})
-            else:
-                db.insert("t", {"id": i, "v": "x" * i})
-            states.append(sorted(r["id"] for r in db.select("t")))
-        db.close()
-        log = open(os.path.join(folder, "wal.log"), "rb").read()
+        states = _write_history(folder)
+        log = (Path(folder) / "wal.log").read_bytes()
         for cut in range(0, len(log) + 1, 3):
             copy = tempfile.mkdtemp()
             try:
-                with open(os.path.join(copy, "wal.log"), "wb") as f:
-                    f.write(log[:cut])
-                recovered = open_db(copy)
-                ids = sorted(r["id"] for r in recovered.select("t"))
-                self.assertEqual(ids, states[recovered.commit_seq], f"cut at byte {cut}")
+                (Path(copy) / "wal.log").write_bytes(log[:cut])
+                recovered = _open(copy)
+                assert _ids(recovered) == states[recovered.commit_seq], f"cut at byte {cut}"
                 recovered.close()
             finally:
                 shutil.rmtree(copy)
@@ -279,25 +359,35 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-Run it from the project directory with `python3.14 -m unittest tests.test_minidb -v`, and again with `python3.14t`:
+Run it from the project directory with `PYTHONPATH=src python3.14 -m unittest tests.test_minidb -v`, and again with `python3.14t`, or through `examples/run_tests.py`:
 
 ```python
-# run
-import sys, unittest
-suite = unittest.defaultTestLoader.loadTestsFromName("tests.test_minidb")
-result = unittest.TextTestRunner(verbosity=1).run(suite)
-assert result.wasSuccessful()
+# examples/run_tests.py
+"""Run the test suite, and fail if any test fails."""
+
+import unittest
+
+
+def main() -> None:
+    """Load ``tests.test_minidb`` and run it."""
+    suite = unittest.defaultTestLoader.loadTestsFromName("tests.test_minidb")
+    result = unittest.TextTestRunner(verbosity=1).run(suite)
+    assert result.wasSuccessful()
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ```text
 ........
 ----------------------------------------------------------------------
-Ran 8 tests in 0.565s
+Ran 8 tests in 0.340s
 
 OK
 ```
 
-The free-threaded build gives the same result (0.7 s).
+The free-threaded build gives the same result (0.9 s).
 
 ## Exercises
 
@@ -307,6 +397,8 @@ The free-threaded build gives the same result (0.7 s).
 4. Break something on purpose: remove the `- changing` in `check_unique` ([§8.2](08-unit-of-work-i.md#82-the-planning-module)). Which test catches it? How many steps does it take? Try the same with three other deliberate bugs. This is *mutation testing*.
 5. The crash test truncates the log, but never corrupts bytes *inside* it. Add a test that flips one random byte in the middle. What should recovery do? What does it do?
 6. *(Research)* Read about deterministic simulation testing (FoundationDB's talk "Testing Distributed Systems w/ Deterministic Simulation" is a good start). How would you make minidb's thread scheduling deterministic for tests?
+
+*Answers: [Appendix D, Appendix B](appendix-d-answers.md#appendix-b--testing-a-database).*
 
 ---
 

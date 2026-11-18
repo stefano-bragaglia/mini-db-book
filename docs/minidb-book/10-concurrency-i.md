@@ -44,7 +44,7 @@ RuntimeError: dictionary changed size during iteration
 
 `Scan` iterates over `table.rows` while `Table.put` adds to it. Python detects that and raises an exception, but only because the dict's *size* changed. An update that replaces a value isn't detected at all, and a scan can see some of a transaction's changes but not others.
 
-**Experiment 3: duplicate primary keys.** Eight threads each try to insert ids 0–1999 into a table whose primary key is `id`, ignoring `UniqueViolation`:
+**Experiment 3: duplicate primary keys.** Eight threads each try to insert ids 0–1999 into a table whose primary key is `id`, ignoring `UniqueError`:
 
 ```text
 GIL True  rows: 2002 distinct ids: 2000
@@ -92,67 +92,104 @@ Two traps need closing.
 ### The code
 
 ```python
-# minidb/database.py (imports)
+# src/minidb/database.py (imports)
 import threading
 from contextlib import contextmanager
+
 from minidb.uow import TransactionError
 ```
 
 ```python
-# minidb/database.py (replace Database.__init__)
-    def __init__(self):
-        self.tables: dict[str, Table] = {}
-        self.foreign_keys: list[ForeignKey] = []
-        self._lock = threading.Lock()
-        self._local = threading.local()         # .uow: this thread's active UoW
+# src/minidb/database.py (typing imports)
+from collections.abc import Iterator
 ```
 
 ```python
-# minidb/database.py (add to Database)
-    # -- concurrency control ------------------------------------------------------------
-    def _active_uow(self):
-        return getattr(self._local, "uow", None)
+# src/minidb/database.py (replace Database.__init__)
+    def __init__(self) -> None:
+        self.tables: dict[str, Table] = {}
+        self.foreign_keys: list[ForeignKey] = []
+        self._lock = threading.Lock()
+        self._local = threading.local()  # .uow: this thread's active unit of work
+```
 
-    def _begin(self, uow) -> None:
-        """Called by a new UnitOfWork: wait for exclusive access."""
-        if self._active_uow() is not None:
+```python
+# src/minidb/database.py (add to Database)
+    # -- concurrency control ------------------------------------------------------------
+    def active_unit_of_work(self) -> UnitOfWork | None:
+        """Return the calling thread's active unit of work, if it has one.
+
+        :return: the unit of work, or ``None``.
+        """
+        uow: UnitOfWork | None = getattr(self._local, "uow", None)
+        return uow
+
+    def begin(self, uow: UnitOfWork) -> None:
+        """Wait for exclusive access on behalf of a new unit of work.
+
+        Units of work call this themselves; applications don't need to.
+
+        :param uow: the unit of work that is starting.
+        :raises TransactionError: if the thread already has an active one.
+        """
+        if self.active_unit_of_work() is not None:
             raise TransactionError("this thread already has an active unit of work")
         self._lock.acquire()
         self._local.uow = uow
 
-    def _end(self, uow) -> None:
-        """Called when a UnitOfWork commits or rolls back."""
+    def end(self, uow: UnitOfWork) -> None:  # noqa: ARG002 - the lock is the same for every unit of work
+        """Release the lock when a unit of work commits or rolls back.
+
+        :param uow: the unit of work that is finishing.
+        """
         self._local.uow = None
         self._lock.release()
 
     @contextmanager
-    def reading(self):
-        """Hold the lock for one read outside any unit of work."""
-        if self._active_uow() is not None:
+    def reading(self) -> Iterator[Database]:
+        """Hold the lock for one read outside any unit of work.
+
+        :return: a context manager that yields the database.
+        :raises TransactionError: if the thread has an active unit of work,
+            which must be used for reading instead.
+        """
+        if self.active_unit_of_work() is not None:
             raise TransactionError("inside a unit of work, read through the unit of work")
         with self._lock:
             yield self
 ```
 
 ```python
-# minidb/database.py (replace Database.get)
+# src/minidb/database.py (replace Database.get)
     def get(self, table: str, rowid: int) -> Row | None:
+        """Return a copy of one row, or ``None``; see :meth:`Table.get`.
+
+        :param table: the table's name.
+        :param rowid: the row to fetch.
+        :return: the row, or ``None``.
+        """
         with self.reading():
             return self.table(table).get(rowid)
 ```
 
 ```python
-# minidb/database.py (replace Database.select)
+# src/minidb/database.py (replace Database.select)
     def select(self, table: str, where: Where = None) -> list[Row]:
+        """Return the rows of ``table`` matching ``where``; see :meth:`Table.match`.
+
+        :param table: the table's name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
+        :return: copies of the matching rows.
+        """
         with self.reading():
             return self.table(table).select(where)
 ```
 
-The Unit of Work calls `_begin` as the last step of `__init__` (so a failure to start leaves nothing half-built) and `_end` when it finishes. It also provides its own `reading()`, which does nothing: a Unit of Work already holds the lock.
+The Unit of Work calls `db.begin(self)` as the last step of `__init__` (so a failure to start leaves nothing half-built) and `db.end(self)` when it finishes. They are public methods, because they're called from another class. Reaching into another object's `_private` members is exactly what ruff's `SLF001` rule forbids, and for a good reason: it couples the two classes' internals. It also provides its own `reading()`, which does nothing: a Unit of Work already holds the lock.
 
 ```python
-# minidb/uow.py (replace UnitOfWork.__init__)
-    def __init__(self, db, *, deferred: bool = False):
+# src/minidb/uow.py (replace UnitOfWork.__init__)
+    def __init__(self, db: Database, *, deferred: bool = False) -> None:
         self.db = db
         self.deferred = deferred
         self.state = "active"
@@ -160,41 +197,76 @@ The Unit of Work calls `_begin` as the last step of `__init__` (so a failure to 
         self._changes: list[Change] = []
         self._identity: dict[tuple[str, int], Record] = {}
         self._snapshots: dict[tuple[str, int], Row] = {}
-        db._begin(self)
+        db.begin(self)
 ```
 
 ```python
-# minidb/uow.py (replace UnitOfWork.commit)
+# src/minidb/uow.py (replace UnitOfWork.commit)
     def commit(self) -> None:
+        """Flush, run the deferred checks if any, apply the net changes, and release the lock.
+
+        :raises ConstraintError: if a deferred check fails; the unit of
+            work then stays active and keeps the lock.
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self.flush()
         if self.deferred:
             ch.check_deferred(self, self._changes)
         self.db.apply(ch.net_changes(self._changes))
         self.state = "committed"
-        self.db._end(self)
+        self.db.end(self)
 ```
 
 ```python
-# minidb/uow.py (replace UnitOfWork.rollback)
+# src/minidb/uow.py (replace UnitOfWork.rollback)
     def rollback(self) -> None:
+        """Forget every change and release the lock.
+
+        :raises TransactionError: if the unit of work is no longer active.
+        """
         self._require_active()
         self._views.clear()
         self._changes.clear()
         self._identity.clear()
         self.state = "rolled back"
-        self.db._end(self)
+        self.db.end(self)
 ```
 
 ```python
-# minidb/uow.py (add to UnitOfWork)
-    def reading(self):
-        return nullcontext(self)                # we already hold the lock
+# src/minidb/uow.py (add to UnitOfWork)
+    def reading(self) -> nullcontext[Self]:
+        """Return a context manager for reads, which does nothing: we hold the lock.
+
+        :return: a context manager that yields the unit of work.
+        """
+        return nullcontext(self)
 ```
 
 ```python
-# minidb/uow.py (imports)
+# src/minidb/uow.py (imports)
 from contextlib import nullcontext
+```
+
+`Query` reads through its state's `reading()`, so the `QueryState` protocol gains that method:
+
+```python
+# src/minidb/query.py (replace QueryState)
+class QueryState(Protocol):
+    """Describe where a query finds its tables, and how it protects its reads."""
+
+    def table(self, name: str) -> Source:
+        """Return the table (or view) called ``name``."""
+        ...
+
+    def reading(self) -> AbstractContextManager[object]:
+        """Return a context manager to hold while the query reads."""
+        ...
+```
+
+```python
+# src/minidb/query.py (typing imports)
+from contextlib import AbstractContextManager
 ```
 
 If `commit` raises, say from a deferred constraint, the Unit of Work stays active and keeps the lock. The caller can fix things and commit again, or roll back. Inside a `with` block that happens automatically: the exception reaches `__exit__`, which rolls back.
@@ -202,23 +274,31 @@ If `commit` raises, say from a deferred constraint, the Unit of Work stays activ
 Queries materialize under the state's `reading()`:
 
 ```python
-# minidb/query.py (replace Query.__iter__)
+# src/minidb/query.py (replace Query.__iter__)
     def __iter__(self) -> Iterator[Row]:
-        with self._db.reading():
-            rows = list(self.plan())          # materialize while protected
+        with self.state.reading():
+            rows = list(self.plan())  # materialize while protected
         return iter(rows)
 ```
 
 ```python
-# minidb/query.py (replace Query.all)
-    def all(self) -> list[dict]:
-        with self._db.reading():
+# src/minidb/query.py (replace Query.all)
+    def all(self) -> list[dict[str, Value | None]]:
+        """Run the query and return every row, as a plain dict.
+
+        :return: the result rows.
+        """
+        with self.state.reading():
             return [dict(row) for row in self.plan()]
 ```
 
 ```python
-# minidb/query.py (replace Query.first)
-    def first(self) -> dict | None:
+# src/minidb/query.py (replace Query.first)
+    def first(self) -> dict[str, Value | None] | None:
+        """Run the query and return its first row.
+
+        :return: the first row, or ``None`` if there are no rows.
+        """
         rows = self.limit(1).all()
         return rows[0] if rows else None
 ```
@@ -258,7 +338,7 @@ With two threads, the second transaction waits for the first, and its uniqueness
 ...     inside.wait()
 ...     try:
 ...         db.insert("users", {"id": 5})
-...     except UniqueViolation as e:
+...     except UniqueError as e:
 ...         results.append("second: " + str(e))
 >>> threads = [threading.Thread(target=first), threading.Thread(target=second)]
 >>> for t in threads: t.start()
@@ -267,49 +347,91 @@ With two threads, the second transaction waits for the first, and its uniqueness
 ['second: users: duplicate key (id=5)']
 ```
 
-And a stress test: the three experiments again, plus an invariant check. Concurrent money transfers must never create or destroy money.
+And a stress test, `examples/transfers.py`: the three experiments again, plus an invariant check. Concurrent money transfers must never create or destroy money. Run it on both builds, with `PYTHONPATH=src python3.14 -m examples.transfers` and with `python3.14t`.
 
 ```python
-# run
-import random, sys, threading
-from minidb import *
+# examples/transfers.py
+"""Move money between accounts from many threads, and check none is lost.
 
-db = Database()
-db.create_table("accounts", [Column("id", Integer()), Column("balance", Integer(min=0))],
-                primary_key="id")
-for i in range(10):
-    db.insert("accounts", {"id": i, "balance": 1000})
+An auditor thread keeps summing all balances while the transfers run; it
+must always see the same total.
+"""
 
-def transfer(seed):
-    rnd = random.Random(seed)
+import random
+import sys
+import threading
+
+from minidb import Column
+from minidb import Database
+from minidb import DomainError
+from minidb import Integer
+from minidb import Sum
+
+ACCOUNTS, START = 10, 1000
+
+
+def gil_enabled() -> bool:
+    """Return whether this interpreter runs with the GIL."""
+    check = getattr(sys, "_is_gil_enabled", None)
+    return bool(check()) if callable(check) else True
+
+
+def transfer(db: Database, seed: int) -> None:
+    """Make 500 random transfers, skipping those that would overdraw.
+
+    :param db: the database.
+    :param seed: the seed for this thread's random choices.
+    """
+    rnd = random.Random(seed)  # noqa: S311 - test data, not cryptography
     for _ in range(500):
-        a, b = rnd.sample(range(10), 2)
+        a, b = rnd.sample(range(ACCOUNTS), 2)
         amount = rnd.randint(1, 100)
         try:
             with db.unit_of_work() as uow:
                 src, dst = uow.find("accounts", {"id": a})[0], uow.find("accounts", {"id": b})[0]
-                src["balance"] -= amount            # DomainError if it would go negative
-                dst["balance"] += amount
+                src["balance"] = int(src["balance"] or 0) - amount  # DomainError below zero
+                dst["balance"] = int(dst["balance"] or 0) + amount
         except DomainError:
             pass
 
-def auditor(stop, problems):
+
+def audit(db: Database, stop: threading.Event, problems: list[object]) -> None:
+    """Sum the balances until ``stop`` is set, recording any wrong total.
+
+    :param db: the database.
+    :param stop: set when the transfers have finished.
+    :param problems: where to record wrong totals.
+    """
     while not stop.is_set():
-        total = db.query("accounts").group_by(total=Sum("balance")).first()["total"]
-        if total != 10_000:
-            problems.append(total)
+        result = db.query("accounts").group_by(total=Sum("balance")).first()
+        if result is None or result["total"] != ACCOUNTS * START:
+            problems.append(result)
 
-stop, problems = threading.Event(), []
-workers = [threading.Thread(target=transfer, args=(s,)) for s in range(8)]
-audit = threading.Thread(target=auditor, args=(stop, problems))
-audit.start()
-for w in workers: w.start()
-for w in workers: w.join()
-stop.set(); audit.join()
 
-final = sum(r["balance"] for r in db.select("accounts"))
-print(f"GIL={sys._is_gil_enabled()} final total={final} audit problems={len(problems)}")
-assert final == 10_000 and not problems
+def main() -> None:
+    """Run eight transfer threads and one auditor, then check the final total."""
+    db = Database()
+    db.create_table("accounts", [Column("id", Integer()), Column("balance", Integer(min=0))], primary_key="id")
+    for i in range(ACCOUNTS):
+        db.insert("accounts", {"id": i, "balance": START})
+    stop, problems = threading.Event(), list[object]()
+    workers = [threading.Thread(target=transfer, args=(db, s)) for s in range(8)]
+    auditor = threading.Thread(target=audit, args=(db, stop, problems))
+    auditor.start()
+    for w in workers:
+        w.start()
+    for w in workers:
+        w.join()
+    stop.set()
+    auditor.join()
+    final = sum(int(r["balance"] or 0) for r in db.select("accounts"))
+    print(f"GIL={gil_enabled()} final total={final} audit problems={len(problems)}")
+    assert final == ACCOUNTS * START
+    assert not problems
+
+
+if __name__ == "__main__":
+    main()
 ```
 
 ```text
@@ -338,6 +460,8 @@ Problem 1 is solved by noticing that reads don't conflict with reads: a **reader
 5. Why does `Database.reading()` refuse to run when the thread has an active Unit of Work, instead of just reading? What would a read from the *database* (not the Unit of Work) show in that situation?
 6. *(Thought experiment)* Our `Query.all()` materializes everything. A query over 10 million rows now needs 10 million dicts in memory. How do real databases stream results to clients without holding locks forever? (Hint: look up *cursors* and *MVCC*.)
 7. *(Measure)* On a free-threaded build, run four threads each doing a 100,000-row aggregate query, first through `db.query` (lock held) and then directly via the operators with no lock. Compare wall-clock times. You'll redo this experiment in [Chapter 11](11-readers-writer-locks.md).
+
+*Answers: [Appendix D, Chapter 10](appendix-d-answers.md#chapter-10--concurrency-part-i).*
 
 ---
 
