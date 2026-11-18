@@ -1,5 +1,7 @@
 """The public entry point: a collection of tables with CRUD operations."""
 from minidb.errors import SchemaError
+from minidb.schema import Column
+from minidb.schema import TableSchema
 from minidb.table import Predicate
 from minidb.table import Row
 from minidb.table import Table
@@ -11,7 +13,7 @@ class Database:
         self._tables: dict[str, Table] = {}
 
     # -- schema -----------------------------------------------------------
-    def create_table(self, name: str, columns: list[str]) -> Table:
+    def create_table(self, name: str, columns: list[Column]) -> Table:
         """Create a table with the given name and columns.
 
         :param name: the name of the table to create
@@ -20,7 +22,7 @@ class Database:
         """
         if name in self._tables:
             raise SchemaError(f"table {name!r} already exists")
-        table = self._tables[name] = Table(name, columns)
+        table = self._tables[name] = Table(TableSchema(name, tuple(columns)))
         return table
 
     def drop_table(self, name: str) -> None:

@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from collections.abc import Mapping
 from types import MappingProxyType
 
-from minidb.errors import SchemaError
+from minidb.schema import TableSchema
 
 type Row = dict[str, object]
 type Predicate = Callable[[Mapping[str, object]], bool]
@@ -13,12 +13,11 @@ type Predicate = Callable[[Mapping[str, object]], bool]
 class Table:
     """Rows stored by a hidden, never-reused integer rowid."""
 
-    def __init__(self, name: str, columns: list[str]):
-        if len(set(columns)) != len(columns):
-            raise SchemaError(f"duplicate column names in {name!r}")
-        self._name: str = name
-        self._columns: tuple[str] = tuple(columns)
-        self._rows: dict[str, dict] = {}
+    def __init__(self, schema: TableSchema):
+        self._schema = schema
+        self._name = schema.name
+        self._columns = schema.column_names
+        self._rows: dict[str, Row] = {}
         self._next_row_id: int = 1
 
     def __len__(self) -> int:
@@ -32,18 +31,6 @@ class Table:
     def columns(self) -> Iterator[str]:
         return self._columns
 
-    # -- helpers --------------------------------------------------------
-    def _check_columns(self, values: Row) -> None:
-        """Check that the values do not contain duplicate columns.
-
-        :param values: the values to check
-        :raises SchemaError: if the values have duplicate columns
-        """
-        unknown = set(values) - set(self.columns)
-        if unknown:
-            raise SchemaError(
-                f"{self.name}: unknown column(s) {', '.join(sorted(unknown))}")
-
     # -- create ---------------------------------------------------------
     def insert(self, values: Row) -> int:
         """Insert a new row into the table.
@@ -55,8 +42,7 @@ class Table:
         :param values: the values to populate the row to be inserted
         :return: the incremental unique identifier used for the new row
         """
-        self._check_columns(values)
-        row = {c: values.get(c) for c in self.columns}  # missing --> None
+        row = self._schema.prepare_row(values)
         row_id = self._next_row_id
         self._next_row_id += 1
         self._rows[row_id] = row
@@ -112,10 +98,12 @@ class Table:
         :param where: the optional predicate to match against
         :return: the number of rows that were updated
         """
-        self._check_columns(changes)
         targets = self.match(where)  # 1. decide
-        for row_id in targets:  # 2. modify
-            self._rows[row_id] = self._rows[row_id] | changes
+        new_rows = {
+            row_id: self._schema.prepare_row(changes, base=self._rows[row_id])
+            for row_id in targets  # 2. validate all
+        }
+        self._rows.update(new_rows)  # 3. modify
         return len(targets)
 
     # -- delete ---------------------------------------------------------

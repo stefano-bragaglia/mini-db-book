@@ -79,27 +79,6 @@ class Type:
 
 
 @dataclass(frozen=True)
-class Boolean(Type):
-    exact_types = (bool,)
-
-    @override
-    def _coerce(self, value: object | None) -> object | None:
-        result = None
-        match value:
-            case bool():
-                result = value
-            case 0 | 1:
-                result = bool(value)
-            case str() if value.strip().lower() in _TRUE:
-                result = True
-            case str() if value.strip().lower() in _FALSE:
-                result = False
-            case _:
-                self._reject(value)
-        return result
-
-
-@dataclass(frozen=True)
 class Integer(Type):
     min: int | None = None
     max: int | None = None
@@ -173,6 +152,27 @@ class Text(Type):
     def _check(self, value: object) -> None:
         if self.max_length is not None and len(value) > self.max_length:
             self._reject(value, f"longer than {self.max_length} characters")
+
+
+@dataclass(frozen=True)
+class Boolean(Type):
+    exact_types = (bool,)
+
+    @override
+    def _coerce(self, value: object | None) -> object | None:
+        result = None
+        match value:
+            case bool():
+                result = value
+            case 0 | 1:
+                result = bool(value)
+            case str() if value.strip().lower() in _TRUE:
+                result = True
+            case str() if value.strip().lower() in _FALSE:
+                result = False
+            case _:
+                self._reject(value)
+        return result
 
 
 @dataclass(frozen=True)
