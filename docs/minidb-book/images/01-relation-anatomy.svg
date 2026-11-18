@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 360" font-family="Helvetica, Arial, sans-serif" font-size="14">
+  <rect width="760" height="360" fill="#ffffff"/>
+  <text x="380" y="30" text-anchor="middle" font-size="18" font-weight="bold" fill="#222">Anatomy of a relation: users</text>
+  <!-- header -->
+  <g transform="translate(150,70)">
+    <rect x="0" y="0" width="460" height="36" fill="#dbe8f7" stroke="#3a6ea5"/>
+    <line x1="80" y1="0" x2="80" y2="180" stroke="#3a6ea5"/>
+    <line x1="240" y1="0" x2="240" y2="180" stroke="#3a6ea5"/>
+    <line x1="380" y1="0" x2="380" y2="180" stroke="#3a6ea5"/>
+    <text x="40" y="23" text-anchor="middle" font-weight="bold">id 🔑</text>
+    <text x="160" y="23" text-anchor="middle" font-weight="bold">email</text>
+    <text x="310" y="23" text-anchor="middle" font-weight="bold">name</text>
+    <text x="420" y="23" text-anchor="middle" font-weight="bold">age</text>
+    <rect x="0" y="36" width="460" height="144" fill="none" stroke="#3a6ea5"/>
+    <rect x="0" y="72" width="460" height="36" fill="#fff4cc" stroke="#c9a400"/>
+    <line x1="0" y1="108" x2="460" y2="108" stroke="#3a6ea5" stroke-opacity="0.4"/>
+    <line x1="0" y1="144" x2="460" y2="144" stroke="#3a6ea5" stroke-opacity="0.4"/>
+    <text x="40" y="60" text-anchor="middle">1</text><text x="160" y="60" text-anchor="middle">ada@example.org</text><text x="310" y="60" text-anchor="middle">Ada</text><text x="420" y="60" text-anchor="middle">36</text>
+    <text x="40" y="96" text-anchor="middle">2</text><text x="160" y="96" text-anchor="middle">alan@example.org</text><text x="310" y="96" text-anchor="middle">Alan</text><text x="420" y="96" text-anchor="middle">41</text>
+    <text x="40" y="132" text-anchor="middle">3</text><text x="160" y="132" text-anchor="middle">grace@example.org</text><text x="310" y="132" text-anchor="middle">Grace</text><text x="420" y="132" text-anchor="middle" fill="#999">NULL</text>
+    <text x="40" y="168" text-anchor="middle">4</text><text x="160" y="168" text-anchor="middle">edgar@example.org</text><text x="310" y="168" text-anchor="middle">Edgar</text><text x="420" y="168" text-anchor="middle">46</text>
+  </g>
+  <!-- labels -->
+  <g fill="#333">
+    <path d="M 610 88 L 650 88" stroke="#3a6ea5" marker-end="url(#a)"/>
+    <text x="655" y="84">attributes</text><text x="655" y="100" font-size="12" fill="#666">(heading / schema)</text>
+    <path d="M 610 160 L 650 160" stroke="#c9a400" marker-end="url(#a)"/>
+    <text x="655" y="156">a tuple</text><text x="655" y="172" font-size="12" fill="#666">(row)</text>
+    <path d="M 190 290 L 190 256" stroke="#3a6ea5" marker-end="url(#a)"/>
+    <text x="130" y="308">primary key</text><text x="130" y="324" font-size="12" fill="#666">unique, never NULL</text>
+    <path d="M 570 290 L 570 256" stroke="#3a6ea5" marker-end="url(#a)"/>
+    <text x="500" y="308">domain of age:</text><text x="500" y="324" font-size="12" fill="#666">integers 0..150, or NULL</text>
+    <path d="M 120 160 L 145 160" stroke="#3a6ea5" marker-end="url(#a)"/>
+    <text x="20" y="148">body:</text><text x="20" y="164" font-size="12" fill="#666">a set of tuples,</text><text x="20" y="178" font-size="12" fill="#666">no order, no</text><text x="20" y="192" font-size="12" fill="#666">duplicates</text>
+  </g>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+</svg>

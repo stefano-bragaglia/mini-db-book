@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 860 340" font-family="Helvetica, Arial, sans-serif" font-size="14">
+  <rect width="860" height="340" fill="#fff"/>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="430" y="24" text-anchor="middle" font-size="16" font-weight="bold">B+ tree of order 4 after inserting 10, 20, …, 100</text>
+  <!-- root -->
+  <rect x="395" y="45" width="70" height="34" rx="4" fill="#dbe8f7" stroke="#3a6ea5"/>
+  <text x="430" y="67" text-anchor="middle">70</text>
+  <text x="480" y="67" fill="#666" font-size="12">root</text>
+  <!-- internal -->
+  <rect x="190" y="125" width="100" height="34" rx="4" fill="#dbe8f7" stroke="#3a6ea5"/>
+  <line x1="240" y1="125" x2="240" y2="159" stroke="#3a6ea5"/>
+  <text x="215" y="147" text-anchor="middle">30</text><text x="265" y="147" text-anchor="middle">50</text>
+  <rect x="630" y="125" width="70" height="34" rx="4" fill="#dbe8f7" stroke="#3a6ea5"/>
+  <text x="665" y="147" text-anchor="middle">90</text>
+  <path d="M 410 79 L 250 123" stroke="#555" marker-end="url(#a)"/>
+  <path d="M 450 79 L 655 123" stroke="#555" marker-end="url(#a)"/>
+  <!-- leaves -->
+  <g>
+    <rect x="30" y="225" width="110" height="40" rx="4" fill="#fff4cc" stroke="#c9a400"/>
+    <text x="57" y="250" text-anchor="middle">10</text><text x="112" y="250" text-anchor="middle">20</text>
+    <rect x="190" y="225" width="110" height="40" rx="4" fill="#fff4cc" stroke="#c9a400"/>
+    <text x="217" y="250" text-anchor="middle">30</text><text x="272" y="250" text-anchor="middle">40</text>
+    <rect x="350" y="225" width="110" height="40" rx="4" fill="#fff4cc" stroke="#c9a400"/>
+    <text x="377" y="250" text-anchor="middle">50</text><text x="432" y="250" text-anchor="middle">60</text>
+    <rect x="510" y="225" width="110" height="40" rx="4" fill="#fff4cc" stroke="#c9a400"/>
+    <text x="537" y="250" text-anchor="middle">70</text><text x="592" y="250" text-anchor="middle">80</text>
+    <rect x="670" y="225" width="110" height="40" rx="4" fill="#fff4cc" stroke="#c9a400"/>
+    <text x="697" y="250" text-anchor="middle">90</text><text x="752" y="250" text-anchor="middle">100</text>
+  </g>
+  <path d="M 200 159 L 95 223" stroke="#555" marker-end="url(#a)"/>
+  <path d="M 240 159 L 245 223" stroke="#555" marker-end="url(#a)"/>
+  <path d="M 280 159 L 395 223" stroke="#555" marker-end="url(#a)"/>
+  <path d="M 645 159 L 565 223" stroke="#555" marker-end="url(#a)"/>
+  <path d="M 685 159 L 725 223" stroke="#555" marker-end="url(#a)"/>
+  <!-- leaf links -->
+  <g stroke="#c9a400" stroke-dasharray="5 3" fill="none">
+    <path d="M 140 245 L 188 245" marker-end="url(#a)"/>
+    <path d="M 300 245 L 348 245" marker-end="url(#a)"/>
+    <path d="M 460 245 L 508 245" marker-end="url(#a)"/>
+    <path d="M 620 245 L 668 245" marker-end="url(#a)"/>
+  </g>
+  <text x="430" y="295" text-anchor="middle" fill="#333">Internal nodes hold separators: go right of a separator when key ≥ separator.</text>
+  <text x="430" y="315" text-anchor="middle" fill="#333">Leaves hold the keys (each with its set of rowids) and link to the next leaf,</text>
+  <text x="430" y="333" text-anchor="middle" fill="#333">so a range scan finds its first leaf in O(log n) and then walks sideways.</text>
+</svg>

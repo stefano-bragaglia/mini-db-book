@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 330" font-family="Helvetica, Arial, sans-serif" font-size="13">
+  <rect width="780" height="330" fill="#fff"/>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="140" y="28" text-anchor="middle" font-weight="bold" font-size="15">index "by_city" (non-unique)</text>
+  <text x="140" y="46" text-anchor="middle" fill="#666">dict: key tuple → set of rowids</text>
+  <text x="560" y="28" text-anchor="middle" font-weight="bold" font-size="15">table.rows</text>
+  <text x="560" y="46" text-anchor="middle" fill="#666">dict: rowid → row</text>
+  <g>
+    <rect x="20" y="70" width="140" height="34" fill="#dbe8f7" stroke="#3a6ea5"/><text x="90" y="92" text-anchor="middle">('London',)</text>
+    <rect x="170" y="70" width="90" height="34" fill="#fff4cc" stroke="#c9a400"/><text x="215" y="92" text-anchor="middle">{1, 4}</text>
+    <rect x="20" y="130" width="140" height="34" fill="#dbe8f7" stroke="#3a6ea5"/><text x="90" y="152" text-anchor="middle">('Paris',)</text>
+    <rect x="170" y="130" width="90" height="34" fill="#fff4cc" stroke="#c9a400"/><text x="215" y="152" text-anchor="middle">{2}</text>
+    <rect x="20" y="190" width="140" height="34" fill="#dbe8f7" stroke="#3a6ea5"/><text x="90" y="212" text-anchor="middle">('Rome',)</text>
+    <rect x="170" y="190" width="90" height="34" fill="#fff4cc" stroke="#c9a400"/><text x="215" y="212" text-anchor="middle">{5}</text>
+    <text x="140" y="262" text-anchor="middle" fill="#666">row 3 has city = NULL:</text>
+    <text x="140" y="280" text-anchor="middle" fill="#666">NULL keys are not indexed</text>
+  </g>
+  <g>
+    <rect x="420" y="70" width="300" height="200" fill="none" stroke="#3a6ea5"/>
+    <text x="440" y="92">1 → {name: 'Ada', city: 'London'}</text>
+    <text x="440" y="132">2 → {name: 'Alan', city: 'Paris'}</text>
+    <text x="440" y="172" fill="#999">3 → {name: 'Grace', city: NULL}</text>
+    <text x="440" y="212">4 → {name: 'Edgar', city: 'London'}</text>
+    <text x="440" y="252">5 → {name: 'Barbara', city: 'Rome'}</text>
+  </g>
+  <path d="M 260 87 C 340 87, 360 87, 430 87" stroke="#c9a400" fill="none" marker-end="url(#a)"/>
+  <path d="M 260 87 C 340 120, 360 200, 430 207" stroke="#c9a400" fill="none" marker-end="url(#a)"/>
+  <path d="M 260 147 C 340 147, 360 127, 430 127" stroke="#c9a400" fill="none" marker-end="url(#a)"/>
+  <path d="M 260 207 C 340 220, 360 247, 430 247" stroke="#c9a400" fill="none" marker-end="url(#a)"/>
+  <text x="390" y="310" text-anchor="middle" fill="#333">lookup(('London',)) = {1, 4} in O(1), then fetch those two rows; no scan needed</text>
+</svg>

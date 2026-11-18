@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 360" font-family="Helvetica, Arial, sans-serif" font-size="13">
+  <rect width="820" height="360" fill="#fff"/>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#555"/></marker></defs>
+  <text x="410" y="26" text-anchor="middle" font-size="16" font-weight="bold">FairRWLock: one FIFO queue of tickets</text>
+
+  <!-- inside the lock -->
+  <rect x="20" y="50" width="200" height="150" rx="10" fill="#e6f4ea" stroke="#2e7d32"/>
+  <text x="120" y="72" text-anchor="middle" font-weight="bold" fill="#2e7d32">holding the lock</text>
+  <circle cx="70" cy="120" r="22" fill="#cfe8d5" stroke="#2e7d32"/><text x="70" y="116" text-anchor="middle">R</text><text x="70" y="131" text-anchor="middle" font-size="11">#4</text>
+  <circle cx="120" cy="120" r="22" fill="#cfe8d5" stroke="#2e7d32"/><text x="120" y="116" text-anchor="middle">R</text><text x="120" y="131" text-anchor="middle" font-size="11">#5</text>
+  <circle cx="170" cy="120" r="22" fill="#cfe8d5" stroke="#2e7d32"/><text x="170" y="116" text-anchor="middle">R</text><text x="170" y="131" text-anchor="middle" font-size="11">#6</text>
+  <text x="120" y="175" text-anchor="middle" font-size="12">readers = 3, writer = False</text>
+  <text x="120" y="191" text-anchor="middle" font-size="12" fill="#555">(entered together as a batch)</text>
+
+  <!-- queue -->
+  <text x="530" y="72" text-anchor="middle" font-weight="bold">waiting, in ticket order</text>
+  <rect x="270" y="95" width="70" height="50" rx="6" fill="#fde2e1" stroke="#c62828" stroke-width="2"/><text x="305" y="116" text-anchor="middle" font-weight="bold">W</text><text x="305" y="133" text-anchor="middle" font-size="11">#7</text>
+  <rect x="360" y="95" width="70" height="50" rx="6" fill="#dbe8f7" stroke="#3a6ea5"/><text x="395" y="116" text-anchor="middle">R</text><text x="395" y="133" text-anchor="middle" font-size="11">#8</text>
+  <rect x="450" y="95" width="70" height="50" rx="6" fill="#dbe8f7" stroke="#3a6ea5"/><text x="485" y="116" text-anchor="middle">R</text><text x="485" y="133" text-anchor="middle" font-size="11">#9</text>
+  <rect x="540" y="95" width="70" height="50" rx="6" fill="#fde2e1" stroke="#c62828"/><text x="575" y="116" text-anchor="middle">W</text><text x="575" y="133" text-anchor="middle" font-size="11">#10</text>
+  <rect x="630" y="95" width="70" height="50" rx="6" fill="#dbe8f7" stroke="#3a6ea5"/><text x="665" y="116" text-anchor="middle">R</text><text x="665" y="133" text-anchor="middle" font-size="11">#11</text>
+  <text x="712" y="125" fill="#666">← arrivals</text>
+  <path d="M 305 165 L 305 150" stroke="#c62828" marker-end="url(#a)"/>
+  <text x="305" y="182" text-anchor="middle" fill="#c62828" font-size="12">serving = 7</text>
+  <text x="305" y="198" text-anchor="middle" font-size="12" fill="#555">waits for readers = 0</text>
+  <path d="M 395 165 C 395 185, 470 185, 485 165" stroke="#3a6ea5" fill="none" stroke-dasharray="4 3"/>
+  <text x="440" y="212" text-anchor="middle" font-size="12" fill="#3a6ea5">#8 and #9 will enter together after #7</text>
+  <text x="620" y="182" text-anchor="middle" font-size="12" fill="#555">next_ticket = 12</text>
+
+  <!-- rules -->
+  <rect x="20" y="235" width="780" height="110" rx="8" fill="#f7f7f7" stroke="#bbb"/>
+  <text x="40" y="260" font-weight="bold">Rules (each checked under one Condition):</text>
+  <text x="40" y="282">• Everyone takes the next ticket on arrival and waits until serving == their ticket.</text>
+  <text x="40" y="302">• A reader at the head enters if no writer is inside, then advances serving, so a run of readers enters together.</text>
+  <text x="40" y="322">• A writer at the head enters when the lock is empty; nobody behind it can overtake. → FIFO, no starvation.</text>
+</svg>
