@@ -1,5 +1,6 @@
 """The public entry point: a collection of tables with CRUD operations."""
 from minidb.errors import SchemaError
+from minidb.schema import Check
 from minidb.schema import Column
 from minidb.schema import TableSchema
 from minidb.table import Predicate
@@ -13,16 +14,19 @@ class Database:
         self._tables: dict[str, Table] = {}
 
     # -- schema -----------------------------------------------------------
-    def create_table(self, name: str, columns: list[Column]) -> Table:
+    def create_table(self, name: str, columns: list[Column],
+                     checks: list[Check] = ()) -> Table:
         """Create a table with the given name and columns.
 
         :param name: the name of the table to create
         :param columns: the columns of the table to create
+        :param checks: the check to perform
         :return: the table with the given name and columns
         """
         if name in self._tables:
-            raise SchemaError(f"table {name!r} already exists")
-        table = self._tables[name] = Table(TableSchema(name, tuple(columns)))
+                raise SchemaError(f"table {name!r} already exists")
+        schema = TableSchema(name, tuple(columns), tuple(checks))
+        table = self._tables[name] = Table(schema)
         return table
 
     def drop_table(self, name: str) -> None:

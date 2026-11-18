@@ -15,3 +15,11 @@ class ConstraintError(DatabaseError):
 
 class DomainError(ConstraintError):
     """A value does not belong to its column's type (domain)."""
+
+
+class NotNullViolation(ConstraintError):
+    """A NOT NULL column received NULL."""
+
+
+class CheckViolation(ConstraintError):
+    """A CHECK constraint evaluated to false."""

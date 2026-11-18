@@ -2,22 +2,34 @@
 from dataclasses import dataclass
 from dataclasses import field
 from functools import reduce
+from types import MappingProxyType
+from typing import Callable
 from typing import Mapping
 
+from minidb import DomainError
 from minidb import SchemaError
+from minidb.errors import CheckViolation
+from minidb.errors import NotNullViolation
 from minidb.normalizers import Normalizer
 from minidb.types import Type
 
 type Row = dict[str, object]
 
+_NO_DEFAULT = object()
+
+type CheckFn = Callable[[object], bool | None]
+
 
 @dataclass(frozen=True)
-class Column[T: Type]:
+class Column:
     name: str
-    type: T
+    type: Type
     normalizers: tuple[Normalizer, ...] = field(default_factory=tuple)
+    nullable: bool = True
+    default: object = None
+    check: CheckFn | None = None
 
-    def prepare(self, value: object) -> T:
+    def prepare(self, value: object) -> Type:
         """Normalize, then validate one value. Raises DomainError."""
         value = self.type.normalize(value)
         if value is not None:
@@ -27,13 +39,22 @@ class Column[T: Type]:
 
 
 @dataclass(frozen=True)
+class Check:
+    """A named row-level CHECK. `predicate(row)` returns True, False or None."""
+    name: str
+    predicate: Callable[[Mapping[str, object]], bool | None]
+
+
+@dataclass(frozen=True)
 class TableSchema:
     name: str
     columns: tuple[Column, ...]
+    checks: tuple[Check, ...] = ()
     by_name: Mapping[str, Column] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self):
         object.__setattr__(self, 'columns', tuple(self.columns))
+        object.__setattr__(self, "checks", tuple(self.checks))
         names = [c.name for c in self.columns]
         if len(set(names)) != len(names):
             raise SchemaError(f"duplicate column names in {self.name!r}")
@@ -57,11 +78,37 @@ class TableSchema:
         """
         for name in values:
             self.column(name)  # unknown column?
-        row = dict(base) if base is not None else dict.fromkeys(self.column_names)
-        for name, value in values.items():
-            from minidb.errors import DomainError
+        if base is None:  # insert
+            row = {c.name: values[c.name] if c.name in values else c.make_default()
+                   for c in self.columns}
+            touched = self.column_names
+        else:  # update
+            row = dict(base) | dict(values)
+            touched = tuple(values)
+        for name in touched:
             try:
-                row[name] = self.by_name[name].prepare(value)
+                row[name] = self.by_name[name].prepare(row[name])
             except DomainError as e:
                 raise DomainError(f"{self.name}.{name}: {e}") from None
+        self._check_not_null(row)
+        self._check_columns(row)
+        self._check_rows(row)
         return row
+
+    # -- stages ---------------------------------------------------------------
+    def _check_not_null(self, row: Row) -> None:
+        for c in self.columns:
+            if not c.nullable and row[c.name] is None:
+                raise NotNullViolation(f"{self.name}.{c.name} may not be NULL")
+
+    def _check_columns(self, row: Row) -> None:
+        for c in self.columns:
+            value = row[c.name]
+            if c.check is not None and value is not None and c.check(value) is False:
+                raise CheckViolation(f"{self.name}.{c.name}: check failed for {value!r}")
+
+    def _check_rows(self, row: Row) -> None:
+        view = MappingProxyType(row)
+        for check in self.checks:
+            if check.predicate(view) is False:
+                raise CheckViolation(f"{self.name}: check {check.name!r} failed")
