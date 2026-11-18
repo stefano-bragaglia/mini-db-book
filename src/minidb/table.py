@@ -1,3 +1,4 @@
+"""In-memory storage for one table."""
 from collections.abc import Callable
 from collections.abc import Iterator
 from collections.abc import Mapping

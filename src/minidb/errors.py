@@ -7,3 +7,11 @@ class DatabaseError(Exception):
 
 class SchemaError(DatabaseError):
     """A table or column does not exist, or a definition is invalid."""
+
+
+class ConstraintError(DatabaseError):
+    """Data was rejected because it violates a rule of the schema."""
+
+
+class DomainError(ConstraintError):
+    """A value does not belong to its column's type (domain)."""
