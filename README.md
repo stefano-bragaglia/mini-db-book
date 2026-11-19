@@ -20,7 +20,7 @@ The book is complete; the code in this repository follows it chapter by chapter 
 |       5 | Keys and indexes               |  ✅  |
 |       6 | Referential integrity          |  ✅  |
 |       7 | Query primitives               |  ✅  |
-|    8–9 | Unit of Work (transactions)    |  ⬜  |
+|    8–9 | Unit of Work (transactions)    |  ✅  |
 |  10–12 | Concurrency and isolation      |  ⬜  |
 |      13 | Persistence                    |  ⬜  |
 |      14 | Query planning                 |  ⬜  |
