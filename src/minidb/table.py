@@ -1,119 +1,138 @@
-"""In-memory storage for one table."""
-from collections.abc import Callable
-from collections.abc import Iterator
-from collections.abc import Mapping
+# src/minidb/table.py
+"""Store the rows of one table in memory.
+
+Rows live in a dict keyed by a hidden *rowid*: an integer from a counter that
+only goes up, so a rowid is never reused, even after its row is deleted.
+Every insert and update goes through the table's schema.
+"""
+
 from types import MappingProxyType
+from typing import TYPE_CHECKING
 
-from minidb.schema import TableSchema
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterator
+    from collections.abc import Mapping
 
-type Row = dict[str, object]
-type Predicate = Callable[[Mapping[str, object]], bool]
+    from minidb.schema import TableSchema
+    from minidb.values import Row
+    from minidb.values import Value
+
+type Predicate = Callable[[Mapping[str, Value | None]], object]
+type Where = Predicate | None
 
 
 class Table:
-    """Rows stored by a hidden, never-reused integer rowid."""
+    """Hold the rows of one table, keyed by a hidden, never-reused rowid.
 
-    def __init__(self, schema: TableSchema):
-        self._schema = schema
-        self._name = schema.name
-        self._columns = schema.column_names
-        self._rows: dict[str, Row] = {}
-        self._next_row_id: int = 1
+    Rows are *values*: the table hands out copies, and replaces stored rows
+    instead of mutating them, so no caller can change a row behind its back.
+
+    >>> from minidb.schema import Column, TableSchema
+    >>> from minidb.types import Integer
+    >>> numbers = Table(TableSchema("numbers", (Column("n", Integer()),)))
+    >>> numbers.insert({"n": "7"})
+    1
+    >>> numbers.get(1)
+    {'n': 7}
+
+    :param schema: the table's declaration.
+    """
+
+    def __init__(self, schema: TableSchema) -> None:
+        self.schema = schema
+        self.name = schema.name
+        self.columns = schema.column_names
+        self.rows: dict[int, Row] = {}
+        self._next_rowid = 1
 
     def __len__(self) -> int:
-        return len(self._rows)
-
-    @property
-    def name(self) -> str:
-        return self._name
-
-    @property
-    def columns(self) -> Iterator[str]:
-        return self._columns
+        return len(self.rows)
 
     # -- create ---------------------------------------------------------
-    def insert(self, values: Row) -> int:
-        """Insert a new row into the table.
+    def insert(self, values: Mapping[str, object]) -> int:
+        """Prepare a row through the schema, store it, and return its rowid.
 
-        The method checks first that the values don't have duplicate columns, then sets to None
-        the value of any missing column, and adds the normalized row to the dictionary using the
-        next unique identifier, eventually updating it.
-
-        :param values: the values to populate the row to be inserted
-        :return: the incremental unique identifier used for the new row
+        :param values: the new row's values, by column name; missing
+            columns are stored as ``None``.
+        :return: the rowid of the new row.
+        :raises SchemaError: if ``values`` names an unknown column.
+        :raises DomainError: if a value doesn't belong to its column's type.
         """
-        row = self._schema.prepare_row(values)
-        row_id = self._next_row_id
-        self._next_row_id += 1
-        self._rows[row_id] = row
-        return row_id
+        row = self.schema.prepare_row(values)
+        rowid = self._next_rowid
+        self._next_rowid += 1
+        self.rows[rowid] = row
+        return rowid
 
     # -- read -----------------------------------------------------------
-    def get(self, row_id: int) -> Row | None:
-        """Return the row with the given row id, if any.
+    def get(self, rowid: int) -> Row | None:
+        """Return a copy of the row with ``rowid``.
 
-        :param row_id: the row id to look up
-        :return: the row with the given row id or None if no such row exists
+        :param rowid: the row to fetch.
+        :return: a copy of the row, or ``None`` if there is no such row.
         """
-        row = self._rows.get(row_id)
-        if row is not None:
-            return dict(row)
-        return None
+        row = self.rows.get(rowid)
+        return dict(row) if row is not None else None
 
-    def scan(self) -> Iterator[dict]:
-        """Return an iterator over the ids and the rows in the table.
+    def scan(self) -> Iterator[tuple[int, Row]]:
+        """Yield every ``(rowid, row)`` pair, each row a fresh copy.
 
-        :return: an iterator over the ids and the rows in the table
+        :return: an iterator over the table, in insertion order.
         """
-        for row_id, row in self._rows.items():
-            yield row_id, dict(row)
+        for rowid, row in self.rows.items():
+            yield rowid, dict(row)
 
-    def match(self, where: Predicate | None = None) -> list[int]:
-        """Return a list of row ids that match the given predicate.
+    def match(self, where: Where = None) -> list[int]:
+        """Return the rowids of the rows that satisfy ``where``.
 
-        If no predicate is given, all rows are matched.
+        The predicate sees each row through a read-only view.
 
-        :param where: the optional predicate to match against
-        :return: a list of row ids that match the given predicate
+        :param where: decides which rows match; ``None`` (the default)
+            matches every row.
+        :return: the matching rowids.
         """
         if where is None:
-            return list(self._rows.keys())
-        return [row_id for row_id, row in self._rows.items() if where(MappingProxyType(row))]
+            return list(self.rows)
+        return [rid for rid, row in self.rows.items() if where(MappingProxyType(row))]
 
-    def select(self, where: Predicate | None = None) -> list[Row]:
-        """Return a list of rows that match the given predicate.
+    def select(self, where: Where = None) -> list[Row]:
+        """Return copies of the rows that satisfy ``where``.
 
-        If no predicate is given, all rows are selected.
-
-        :param where: the optional predicate to match against
-        :return: a list of rows that match the given predicate
+        :param where: decides which rows match; ``None`` (the default)
+            matches every row.
+        :return: the matching rows.
         """
-        return [dict(self._rows[row_id]) for row_id in self.match(where)]
+        return [dict(self.rows[rid]) for rid in self.match(where)]
 
     # -- update ---------------------------------------------------------
-    def update(self, changes: Row, where: Predicate | None = None) -> int:
-        """Update the rows matching the given predicate with the given changes.
+    def update(self, changes: Mapping[str, object], where: Where = None) -> int:
+        """Set the columns in ``changes`` on every row that satisfies ``where``.
 
-        :param changes: the changes to apply
-        :param where: the optional predicate to match against
-        :return: the number of rows that were updated
+        Every new row is prepared before any is stored, so a value that fails
+        validation leaves the whole table unchanged.
+
+        :param changes: the new values, by column name.
+        :param where: decides which rows change; ``None`` (the default)
+            changes every row.
+        :return: the number of rows changed.
+        :raises SchemaError: if ``changes`` names an unknown column.
+        :raises DomainError: if a value doesn't belong to its column's type.
         """
         targets = self.match(where)  # 1. decide
-        new_rows = {
-            row_id: self._schema.prepare_row(changes, base=self._rows[row_id])
-            for row_id in targets  # 2. validate all
-        }
-        self._rows.update(new_rows)  # 3. modify
+        new_rows = {rid: self.schema.prepare_row(changes, base=self.rows[rid]) for rid in targets}  # 2. validate
+        self.rows.update(new_rows)  # 3. modify
         return len(targets)
 
     # -- delete ---------------------------------------------------------
-    def delete(self, where: Predicate | None = None) -> int:
-        """Delete the rows matching the given predicate.
+    def delete(self, where: Where = None) -> int:
+        """Remove every row that satisfies ``where``.
 
-        :param where: the optional predicate to match against
-        :return: the number of rows that were deleted
+        :param where: decides which rows go; ``None`` (the default) removes
+            every row.
+        :return: the number of rows removed.
         """
         targets = self.match(where)
-        for row_id in targets:
-            self._rows.pop(row_id)
+        for rowid in targets:
+            del self.rows[rowid]
         return len(targets)

@@ -1,7 +1,7 @@
 [project]
 name = "minidb"
 version = "0.1.0"
-description = "Add your description here"
+description = "A small relational database, built in the book"
 readme = "README.md"
 authors = [
     { name = "Stefano Bragaglia", email = "stefano-bragaglia@users.noreply.github.com" }
@@ -15,3 +15,60 @@ minidb = "minidb:main"
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+# ---------------------------------------------------------------------------
+# Ruff — linter + formatter
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+src = ["src"]
+extend-exclude = [".idea"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+    "D105", # docstring in magic methods (dunders are not documented)
+    "D107", # docstring in __init__ (the class docstring covers it)
+    "EM", # exception message must not be a string literal
+    "TRY003", # long messages outside the exception class
+    "CPY", # copyright header
+    "COM812", # trailing comma (conflicts with the formatter)
+    "T201", # print
+    "S101", # assert
+    "PLR2004", # magic values in comparisons
+    "PLR0913", # too many arguments
+    "E501", # line too long (the formatter handles it)
+]
+
+[tool.ruff.lint.isort]
+force-single-line = true
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257" # Standard reStructuredText-compatible docstring style
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+
+[tool.ruff.lint.mccabe]
+# Grade A complexity corresponds to a score of 1 to 5
+max-complexity = 5
+
+[tool.ruff.lint.pep8-naming]
+# Qt virtual overrides are camelCase (mousePressEvent, sizeHint, ...)
+extend-ignore-names = ["*Event", "sizeHint", "minimumSizeHint", "boundingRect", "paint", "itemChange", "shape"]
+
+[tool.ruff.format]
+docstring-code-format = true
+
+# ---------------------------------------------------------------------------
+# Pyrefly — type checker
+# ---------------------------------------------------------------------------
+[tool.pyrefly]
+preset = "strict"           # ~ basedpyright typeCheckingMode = "all"
+project-includes = ["src"]
+python-version = "3.14"
+search-path = ["src"]
+
+[tool.pyrefly.errors]
+unused-call-result = false  # ~ reportUnusedCallResult = false

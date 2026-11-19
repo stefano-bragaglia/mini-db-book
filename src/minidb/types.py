@@ -1,4 +1,6 @@
-"""Column types. Each type knows how to normalize and validate its values."""
+# src/minidb/types.py
+"""Define column types: how each one normalizes and validates its values."""
+
 import datetime as dt
 import math
 import re
@@ -6,274 +8,318 @@ from dataclasses import dataclass
 from decimal import Decimal
 from decimal import InvalidOperation
 from decimal import ROUND_HALF_EVEN
+from typing import ClassVar
 from typing import override
 
 from minidb.errors import DomainError
-
-_TRUE = {"true", "t", "yes", "y", "on", "1"}
-_FALSE = {"false", "f", "no", "n", "off", "0"}
+from minidb.values import Value
 
 _INT_RE = re.compile(r"[+-]?\d+")
+_TRUE = frozenset({"true", "t", "yes", "y", "on", "1"})
+_FALSE = frozenset({"false", "f", "no", "n", "off", "0"})
 
 
-class Type:
-    """Base class for column types.
+class Type[T: Value]:
+    """Describe a column type: how to normalize its values, and which are valid.
 
-    normalize(): turn an acceptable input into the canonical stored form.
-    validate(): check that a value already is in canonical form.
-    NULL (None) passes through both untouched; NOT NULL is a constraint,
-    not a type (see Chapter 4).
+    :meth:`normalize` turns an acceptable input into the one canonical value
+    that is stored; :meth:`validate` checks that a value already is canonical
+    and inside the type's domain. NULL (``None``) passes through both
+    untouched: whether a column may hold NULL is a constraint, not a type.
+
+    Subclasses set :attr:`exact_types`, override :meth:`coerce`, and extend
+    :meth:`validate` with rules such as ranges and lengths.
     """
-    exact_types: tuple[type, ...] = (object,)
 
-    def normalize(self, value: object | None) -> object | None:
-        """Turn an acceptable input into the canonical stored form.
+    exact_types: ClassVar[tuple[type, ...]] = ()
 
-        `None` is a valid value and its canonical form is `None`.
+    def normalize(self, value: object) -> T | None:
+        """Convert ``value`` to this type's canonical form.
 
-        :param value: the value to normalize, or `None`
-        :return: the normalized value, or `None`
+        :param value: any input; ``None`` is returned unchanged.
+        :return: the canonical value, or ``None``.
+        :raises DomainError: if ``value`` can't be converted.
         """
-        if value is None:
+        return None if value is None else self.coerce(value)
+
+    def coerce(self, value: object) -> T:
+        """Convert a non-NULL ``value``; subclasses override this.
+
+        :param value: the input, never ``None``.
+        :return: the canonical value.
+        :raises DomainError: always, in the base class.
+        """
+        raise self.error(value)
+
+    def validate(self, value: object) -> None:
+        """Check that ``value`` is canonical and inside the domain.
+
+        The check is on the *exact* Python type: ``bool`` is a subclass of
+        ``int``, but ``True`` is not a valid integer.
+
+        :param value: the value to check; ``None`` always passes.
+        :raises DomainError: if the value is not valid.
+        """
+        if value is not None and type(value) not in self.exact_types:
+            raise self.error(value)
+
+    def error(self, value: object, reason: str = "") -> DomainError:
+        """Build the error that rejects ``value``.
+
+        :param value: the rejected value.
+        :param reason: why it was rejected; empty by default.
+        :return: an exception for the caller to raise.
+        """
+        return DomainError(f"{value!r} is not a valid {self!r}" + (f": {reason}" if reason else ""))
+
+
+def _integral(value: object) -> int | None:
+    """Return ``value`` as an int if it is a whole float or Decimal, or a numeric string."""
+    match value:
+        case float() if value.is_integer():
+            return int(value)
+        case Decimal() if value.is_finite() and value == value.to_integral_value():
+            return int(value)
+        case str() if _INT_RE.fullmatch(value.strip()):
+            return int(value.strip())
+        case _:
             return None
-        return self._coerce(value)
-
-    def _coerce(self, value: object) -> object:
-        """Convert `value` to its canonical form or call self.reject(value).
-
-        This method should be overridden by subclasses.
-        `None` is not a coercible value.
-
-        :param value: the value to coerce
-        :return: the coerced value
-        :raises DomainError: if `value` is not a valid
-        """
-        raise NotImplementedError()
-        return value
-
-    def validate(self, value: object | None) -> None:
-        """Validate `value`, if it is not a valid."""
-        if value is None:
-            return
-        if object not in self.exact_types and type(value) not in self.exact_types:
-            self._reject(value)
-        self._check(value)
-
-    def _check(self, value: object) -> None:
-        """Perform extra domain rules checks against `value`, such as ranges and lengths.
-
-        :param value: the value to check
-        :raises DomainError: if `value` is not a valid
-        """
-        raise NotImplementedError()
-
-    def _reject(self, value: object, reason: str = "") -> None:
-        """Reject `value` if it is not a valid.
-
-        :param value: the value to reject
-        :param reason: the optional reason of rejection
-        :raises DomainError: if `value` is not a valid
-        """
-        raise DomainError(f"{value!r} is not a valid {self!r}"
-                          + (f": {reason}" if reason else ""))
 
 
 @dataclass(frozen=True)
-class Integer(Type):
+class Integer(Type[int]):
+    """Hold whole numbers, optionally between ``min`` and ``max``.
+
+    >>> Integer(min=0).normalize(" 42 ")
+    42
+
+    :param min: the smallest valid value; ``None`` (the default) for no limit.
+    :param max: the largest valid value; ``None`` (the default) for no limit.
+    """
+
     min: int | None = None
     max: int | None = None
-    exact_types = (int,)
+    exact_types: ClassVar[tuple[type, ...]] = (int,)
 
     @override
-    def _coerce(self, value: object | None) -> int | None:
-        result = None
-        match value:
-            case bool():
-                self._reject(value, "booleans are not integers")
-            case int():
-                result = value
-            case float() if value.is_integer():
-                result = int(value)
-            case Decimal() if value.is_finite() and value == value.to_integral_value():
-                result = int(value)
-            case str() if _INT_RE.fullmatch(value.strip()):
-                result = int(value.strip())
-            case _:
-                self._reject(value)
-        return result
+    def coerce(self, value: object) -> int:
+        if isinstance(value, bool):
+            raise self.error(value, "booleans are not integers")
+        if isinstance(value, int):
+            return value
+        number = _integral(value)
+        if number is None:
+            raise self.error(value)
+        return number
 
     @override
-    def _check(self, value: object) -> None:
-        if self.min is not None and value < self.min:
-            self._reject(value, f"below minimum {self.min}")
-        if self.max is not None and value > self.max:
-            self._reject(value, f"above maximum {self.max}")
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, int):
+            if self.min is not None and value < self.min:
+                raise self.error(value, f"below minimum {self.min}")
+            if self.max is not None and value > self.max:
+                raise self.error(value, f"above maximum {self.max}")
 
 
 @dataclass(frozen=True)
-class Real(Type):
-    exact_types = (float,)
+class Real(Type[float]):
+    """Hold finite floating-point numbers; NaN and infinities are rejected.
+
+    >>> Real().normalize("2.5")
+    2.5
+    """
+
+    exact_types: ClassVar[tuple[type, ...]] = (float,)
 
     @override
-    def _coerce(self, value: object | None) -> float | None:
-        result = None
-        match value:
-            case bool():
-                self._reject(value, "booleans are not numbers")
-            case int() | float() | Decimal():
-                result = float(value)
-            case str():
-                try:
-                    result = float(value.strip())
-                except ValueError:
-                    self._reject(value)
-            case _:
-                self._reject(value)
-        return result
+    def coerce(self, value: object) -> float:
+        if isinstance(value, bool):
+            raise self.error(value, "booleans are not numbers")
+        if isinstance(value, int | float | Decimal):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                raise self.error(value) from None
+        raise self.error(value)
 
     @override
-    def _check(self, value: object) -> None:
-        if not math.isfinite(value):
-            self._reject(value, "NaN and infinities are not allowed")
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise self.error(value, "NaN and infinities are not allowed")
 
 
 @dataclass(frozen=True)
-class Text(Type):
+class Text(Type[str]):
+    """Hold strings, optionally no longer than ``max_length`` characters.
+
+    >>> Text().normalize(42)
+    Traceback (most recent call last):
+      ...
+    minidb.errors.DomainError: 42 is not a valid Text(max_length=None): no implicit conversion to text
+
+    :param max_length: the longest valid string; ``None`` (the default) for no limit.
+    """
+
     max_length: int | None = None
-    exact_types = (str,)
+    exact_types: ClassVar[tuple[type, ...]] = (str,)
 
     @override
-    def _coerce(self, value: object | None) -> object | None:
+    def coerce(self, value: object) -> str:
         if not isinstance(value, str):
-            self._reject(value, "no implicit conversion to text")
+            raise self.error(value, "no implicit conversion to text")
         return value
 
     @override
-    def _check(self, value: object) -> None:
-        if self.max_length is not None and len(value) > self.max_length:
-            self._reject(value, f"longer than {self.max_length} characters")
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, str) and self.max_length is not None and len(value) > self.max_length:
+            raise self.error(value, f"longer than {self.max_length} characters")
 
 
 @dataclass(frozen=True)
-class Boolean(Type):
-    exact_types = (bool,)
+class Boolean(Type[bool]):
+    """Hold ``True`` or ``False``, accepting 0/1 and words such as "yes" and "off".
+
+    >>> Boolean().normalize("Yes"), Boolean().normalize(0)
+    (True, False)
+    """
+
+    exact_types: ClassVar[tuple[type, ...]] = (bool,)
 
     @override
-    def _coerce(self, value: object | None) -> object | None:
-        result = None
-        match value:
-            case bool():
-                result = value
-            case 0 | 1:
-                result = bool(value)
-            case str() if value.strip().lower() in _TRUE:
-                result = True
-            case str() if value.strip().lower() in _FALSE:
-                result = False
-            case _:
-                self._reject(value)
-        return result
+    def coerce(self, value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value in (0, 1):
+            return value == 1
+        word = value.strip().lower() if isinstance(value, str) else None
+        if word in _TRUE or word in _FALSE:
+            return word in _TRUE
+        raise self.error(value)
+
+
+def _to_decimal(value: object) -> Decimal | None:
+    """Return ``value`` as a Decimal, or ``None`` if it isn't a number."""
+    if isinstance(value, float):
+        return Decimal(repr(value))  # 0.1 -> Decimal('0.1'), not its binary value
+    if isinstance(value, int | Decimal) and not isinstance(value, bool):
+        return Decimal(value)
+    if isinstance(value, str):
+        try:
+            return Decimal(value.strip())
+        except InvalidOperation:
+            return None
+    return None
 
 
 @dataclass(frozen=True)
-class Numeric(Type):
-    """Exact decimal with `precision` total digits, `scale` after the point."""
+class Numeric(Type[Decimal]):
+    """Hold exact decimals with ``precision`` digits, ``scale`` of them after the point.
+
+    Values are rounded to ``scale`` places with banker's rounding.
+
+    >>> Numeric(6, 2).normalize(0.1)
+    Decimal('0.10')
+
+    :param precision: the total number of digits; 18 by default.
+    :param scale: the digits after the decimal point; 2 by default.
+    :raises ValueError: unless ``0 <= scale <= precision``.
+    """
 
     precision: int = 18
     scale: int = 2
-    exact_types = (Decimal,)
+    exact_types: ClassVar[tuple[type, ...]] = (Decimal,)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not 0 <= self.scale <= self.precision:
             raise ValueError("need 0 <= scale <= precision")
 
     @override
-    def _coerce(self, value: object | None) -> object | None:
-        match value:
-            case bool():
-                self._reject(value)
-            case float():
-                value = Decimal(repr(value))  # 0.1 -> Decimal('0.1')
-            case int() | Decimal():
-                value = Decimal(value)
-            case str():
-                try:
-                    value = Decimal(value.strip())
-                except InvalidOperation:
-                    self._reject(value)
-            case _:
-                self._reject(value)
-        decimal_value: Decimal = value
-        if not decimal_value.is_finite():
-            self._reject(value, "NaN and infinities are not allowed")
-        return decimal_value.quantize(Decimal(1).scaleb(-self.scale), ROUND_HALF_EVEN)
+    def coerce(self, value: object) -> Decimal:
+        number = _to_decimal(value)
+        if number is None:
+            raise self.error(value)
+        if not number.is_finite():
+            raise self.error(value, "NaN and infinities are not allowed")
+        return number.quantize(Decimal(1).scaleb(-self.scale), ROUND_HALF_EVEN)
 
     @override
-    def _check(self, value: object) -> None:
-        decimal_value: Decimal = value
-        if decimal_value.as_tuple().exponent != -self.scale:
-            self._reject(value, f"expected exactly {self.scale} decimal places")
-        digits_before_point = max(decimal_value.adjusted() + 1, 0)
-        if digits_before_point > self.precision - self.scale:
-            self._reject(value, f"too many digits for NUMERIC({self.precision}, {self.scale})")
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if not isinstance(value, Decimal):
+            return
+        if value.as_tuple().exponent != -self.scale:
+            raise self.error(value, f"expected exactly {self.scale} decimal places")
+        if max(value.adjusted() + 1, 0) > self.precision - self.scale:
+            raise self.error(value, f"too many digits for NUMERIC({self.precision}, {self.scale})")
 
 
 @dataclass(frozen=True)
-class Date(Type):
-    exact_types = (dt.date,)
+class Date(Type[dt.date]):
+    """Hold calendar dates, accepting ISO strings such as ``"2026-11-18"``.
+
+    >>> Date().normalize("2026-11-18")
+    datetime.date(2026, 11, 18)
+    """
+
+    exact_types: ClassVar[tuple[type, ...]] = (dt.date,)
 
     @override
-    def _coerce(self, value: object | None) -> object | None:
-        result = None
-        match value:
-            case dt.datetime():
-                self._reject(value, "use .date() to drop the time explicitly")
-            case dt.date():
-                result = value
-            case str():
-                try:
-                    return dt.date.fromisoformat(value.strip())
-                except ValueError:
-                    self._reject(value)
-            case _:
-                self._reject(value)
-        return result
-
-
-@dataclass(frozen=True)
-class Timestamp(Type):
-    """A datetime. With with_timezone=True, values must be aware and are
-    stored in UTC; otherwise they must be naive."""
-
-    with_timezone: bool = True
-    exact_types = (dt.datetime,)
-
-    @override
-    def _coerce(self, value: object | None) -> object | None:
+    def coerce(self, value: object) -> dt.date:
+        if isinstance(value, dt.datetime):
+            raise self.error(value, "use .date() to drop the time explicitly")
+        if isinstance(value, dt.date):
+            return value
         if isinstance(value, str):
             try:
-                value = dt.datetime.fromisoformat(value.strip())
+                return dt.date.fromisoformat(value.strip())
             except ValueError:
-                self._reject(value)
+                raise self.error(value) from None
+        raise self.error(value)
 
-        if not isinstance(value, dt.datetime):
-            self._reject(value)
 
-        datetime_value: dt.datetime = value
-        aware = datetime_value.tzinfo is not None and datetime_value.utcoffset() is not None
-        if self.with_timezone:
-            if not aware:
-                self._reject(value, "a timezone is required")
-            return datetime_value.astimezone(dt.UTC)
+@dataclass(frozen=True)
+class Timestamp(Type[dt.datetime]):
+    """Hold points in time: all timezone-aware (stored in UTC), or all naive.
 
-        if aware:
-            self._reject(value, "timezone not allowed")
+    Python refuses to compare aware and naive datetimes, so a column must
+    pick one kind.
 
-        return datetime_value
+    >>> Timestamp().normalize("2026-11-18T10:00:00+01:00")
+    datetime.datetime(2026, 11, 18, 9, 0, tzinfo=datetime.timezone.utc)
+
+    :param with_timezone: whether values must be aware; ``True`` by default.
+    """
+
+    with_timezone: bool = True
+    exact_types: ClassVar[tuple[type, ...]] = (dt.datetime,)
 
     @override
-    def _check(self, value: object) -> None:
-        if self.with_timezone:
-            datetime_value: dt.datetime = value
-            if datetime_value.utcoffset() != dt.timedelta(0):
-                self._reject(value, "must be stored in UTC")
+    def coerce(self, value: object) -> dt.datetime:
+        stamp = self._parse(value)
+        aware = stamp.utcoffset() is not None
+        if self.with_timezone and not aware:
+            raise self.error(value, "a timezone is required")
+        if not self.with_timezone and aware:
+            raise self.error(value, "timezone not allowed")
+        return stamp.astimezone(dt.UTC) if aware else stamp
+
+    def _parse(self, value: object) -> dt.datetime:
+        if isinstance(value, dt.datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return dt.datetime.fromisoformat(value.strip())
+            except ValueError:
+                raise self.error(value) from None
+        raise self.error(value)
+
+    @override
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, dt.datetime) and self.with_timezone and value.utcoffset() != dt.timedelta(0):
+            raise self.error(value, "must be stored in UTC")

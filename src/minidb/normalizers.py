@@ -1,94 +1,73 @@
-"""Small value normalizers for Column(normalizers=...).
+"""Provide small value normalizers for ``Column(normalizers=...)``.
 
-Every normalizer must be idempotent: f(f(x)) == f(x). Rows are re-normalized
-whenever they are updated, so a non-idempotent normalizer would change data
-that nobody touched.
+Every normalizer must be idempotent, ``f(f(x)) == f(x)``: rows are
+re-normalized whenever they are updated, so a normalizer that isn't would
+change data nobody touched. Normalizers leave non-text values alone, so any
+of them can be put on any column.
 """
+
 import unicodedata
-from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-type Normalizer[T] = Callable[[T], T]
+if TYPE_CHECKING:
+    from minidb.values import Value
 
 
-def strip(s: str) -> str:
-    """Remove leading and trailing whitespace from a string.
+def strip(value: Value) -> Value:
+    """Remove leading and trailing whitespace from text.
 
-    >>> strip("  hello world  ")
-    'hello world'
+    >>> strip("  Ada ")
+    'Ada'
 
-    :param s: The input string.
-    :return: The stripped string.
+    :param value: the value to normalize.
+    :return: the stripped text, or ``value`` unchanged if it isn't text.
     """
-    return s.strip()
+    return value.strip() if isinstance(value, str) else value
 
 
-def lower(s: str) -> str:
-    """Convert a string to lowercase.
+def lower(value: Value) -> Value:
+    """Lower-case text.
 
-    >>> lower("Hello World!")
-    'hello world!'
+    >>> lower("Ada@Example.ORG")
+    'ada@example.org'
 
-    Careful with lower. Lower-casing is fine for e-mail domains but technically
-    wrong for the part before the @, which the standard allows to be case-sensitive.
-    For caseless matching of natural-language text, str.casefold() is more
-    correct than lower() ("Straße".casefold() == "strasse"). Normalisation is
-    a policy, which is why it's per column and opt-in.
-
-    :param s: The input string.
-    :return: The lowercase string.
+    :param value: the value to normalize.
+    :return: the lower-cased text, or ``value`` unchanged if it isn't text.
     """
-    return s.lower()
+    return value.lower() if isinstance(value, str) else value
 
 
-def upper(s: str) -> str:
-    """Convert a string to uppercase.
+def upper(value: Value) -> Value:
+    """Upper-case text.
 
-    >>> upper("Hello World!")
-    'HELLO WORLD!'
-
-    :param s: The input string.
-    :return: The uppercase string.
+    :param value: the value to normalize.
+    :return: the upper-cased text, or ``value`` unchanged if it isn't text.
     """
-    return s.upper()
+    return value.upper() if isinstance(value, str) else value
 
 
-def collapse_spaces(s: str) -> str:
-    """Collapse consecutive whitespace characters into a single space.
+def collapse_spaces(value: Value) -> Value:
+    """Trim text and replace each run of whitespace with a single space.
 
-    Strips leading and trailing whitespace, and normalises internal runs
-    of whitespace.
-
-    >>> collapse_spaces('  Ada   Lovelace ')
+    >>> collapse_spaces("  Ada   Lovelace ")
     'Ada Lovelace'
 
-    :param s: The input string to process.
-    :return: The string with extra whitespace collapsed.
+    :param value: the value to normalize.
+    :return: the collapsed text, or ``value`` unchanged if it isn't text.
     """
-    return " ".join(s.split())
+    return " ".join(value.split()) if isinstance(value, str) else value
 
 
-def nfc(s: str) -> str:
-    """Normalize the string `s` to its Unicode Normalisation Form C (NFC).
+def nfc(value: Value) -> Value:
+    """Convert text to Unicode normalization form NFC.
 
-    NFC uses canonical composition, ensuring that characters like "é" are stored
-    as a single precomposed code point (U+00E9) rather than a base character
-    followed by a combining accent (U+0065 U+0301). This ensures that visually
-    identical strings with different underlying byte sequences (such as precomposed
-    'é' versus 'e' followed by a combining acute accent) compare as equal.
+    Visually identical strings can be different sequences of code points;
+    NFC picks one canonical sequence for each.
 
-    >>> composed = "café"           # Single code point (U+00E9)
-    >>> decomposed = "cafe\u0301"   # 'e' + combining acute accent (U+0301)
-    >>> composed == decomposed
-    False
-    >>> nfc(decomposed) == composed
+    >>> nfc("café") == "café"
     True
 
-    Text pasted from a macOS file name is often decomposed, whereas text typed
-    on most keyboards is composed. Without NFC, a unique index on names would
-    accept both "café" strings. The Unicode standard defines these
-    normalisation forms in UAX #15.
-
-    :param s: the input string to normalize
-    :return: the NFC-normalized string
+    :param value: the value to normalize.
+    :return: the NFC form of the text, or ``value`` unchanged if it isn't text.
     """
-    return unicodedata.normalize("NFC", s)
+    return unicodedata.normalize("NFC", value) if isinstance(value, str) else value

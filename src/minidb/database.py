@@ -1,91 +1,114 @@
-"""The public entry point: a collection of tables with CRUD operations."""
+"""Provide the public entry point: a collection of tables with CRUD operations."""
+
+from typing import TYPE_CHECKING
+
 from minidb.errors import SchemaError
 from minidb.schema import Check
 from minidb.schema import Column
 from minidb.schema import TableSchema
-from minidb.table import Predicate
-from minidb.table import Row
 from minidb.table import Table
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from collections.abc import Sequence
+
+    from minidb.table import Where
+    from minidb.values import Row
 
 
 class Database:
+    """Hold tables by name, and run CRUD operations on them."""
 
     def __init__(self) -> None:
-        self._tables: dict[str, Table] = {}
+        self.tables: dict[str, Table] = {}
 
     # -- schema -----------------------------------------------------------
-    def create_table(self, name: str, columns: list[Column],
-                     checks: list[Check] = ()) -> Table:
-        """Create a table with the given name and columns.
+    def create_table(self, name: str, columns: Sequence[Column], checks: Sequence[Check] = ()) -> Table:
+        """Create an empty table and return it.
 
-        :param name: the name of the table to create
-        :param columns: the columns of the table to create
-        :param checks: the check to perform
-        :return: the table with the given name and columns
+        >>> from minidb.schema import Column
+        >>> from minidb.types import Text
+        >>> db = Database()
+        >>> db.create_table("users", [Column("name", Text())]).columns
+        ('name',)
+
+        :param name: the new table's name.
+        :param columns: its columns, in order.
+        :param checks: its row-level CHECK constraints; none by default.
+        :return: the new table.
+        :raises SchemaError: if the table already exists, or two columns
+            share a name.
         """
-        if name in self._tables:
-                raise SchemaError(f"table {name!r} already exists")
+        if name in self.tables:
+            raise SchemaError(f"table {name!r} already exists")
         schema = TableSchema(name, tuple(columns), tuple(checks))
-        table = self._tables[name] = Table(schema)
+        table = self.tables[name] = Table(schema)
         return table
 
     def drop_table(self, name: str) -> None:
-        """Drop a table with the given name.
+        """Delete a table and all its rows.
 
-        :param name: the name of the table to drop
+        :param name: the table to delete.
+        :raises SchemaError: if there is no such table.
         """
         self.table(name)  # raises if missing
-        self._tables.pop(name)
+        del self.tables[name]
 
     def table(self, name: str) -> Table:
+        """Return the table called ``name``.
+
+        :param name: the table's name.
+        :return: the table.
+        :raises SchemaError: if there is no such table.
+        """
         try:
-            return self._tables[name]
+            return self.tables[name]
         except KeyError:
             raise SchemaError(f"no such table: {name!r}") from None
 
     # -- CRUD -------------------------------------------------------------
-    def insert(self, table: str, values: Row) -> int:
-        """Insert a row into a given table.
+    def insert(self, table: str, values: Mapping[str, object]) -> int:
+        """Insert a row into ``table``; see :meth:`Table.insert`.
 
-        :param table: the name of the table to insert into
-        :param values: the row values to insert
-        :return: the inserted row id
+        :param table: the table's name.
+        :param values: the new row's values, by column name.
+        :return: the rowid of the new row.
         """
         return self.table(table).insert(values)
 
-    def get(self, table: str, row_id: int) -> Row | None:
-        """Return the row with given row id from the given table, if any.
+    def get(self, table: str, rowid: int) -> Row | None:
+        """Return a copy of one row; see :meth:`Table.get`.
 
-        :param table: the name of the table to look up
-        :param row_id: the row id to look up
-        :return: the row with the given row id, or None
+        :param table: the table's name.
+        :param rowid: the row to fetch.
+        :return: the row, or ``None`` if there is no such row.
         """
-        return self.table(table).get(row_id)
+        return self.table(table).get(rowid)
 
-    def select(self, table: str, where: Predicate | None = None) -> list[Row]:
-        """Select the rows from a table with the given name matching the given predicate.
+    def select(self, table: str, where: Where = None) -> list[Row]:
+        """Return the rows of ``table`` that satisfy ``where``.
 
-        :param table: the name of the table to select from
-        :param where: the optional predicate to match the rows to select
-        :return: the rows from the table with the given name matching the given predicate
+        :param table: the table's name.
+        :param where: decides which rows match; ``None`` matches all.
+        :return: copies of the matching rows.
         """
         return self.table(table).select(where)
 
-    def update(self, table: str, changes: Row, where: Predicate | None = None) -> int:
-        """Update the rows from the table with the given name matching the given predicate with the given changes.
+    def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
+        """Update the rows of ``table`` that satisfy ``where``.
 
-        :param table: the name of the table to update
-        :param changes: the new row to update
-        :param where: the optional predicate to match the rows to update
-        :return: the number of rows that were updated
+        :param table: the table's name.
+        :param changes: the new values, by column name.
+        :param where: decides which rows change; ``None`` changes all.
+        :return: the number of rows changed.
         """
         return self.table(table).update(changes, where)
 
-    def delete(self, table: str, where: Predicate | None = None) -> int:
-        """Delete the rows from the table with the given name matching the given predicate.
+    def delete(self, table: str, where: Where = None) -> int:
+        """Delete the rows of ``table`` that satisfy ``where``.
 
-        :param table: the name of the table to delete
-        :param where: the optional predicate to match the rows to delete
-        :return: the number of rows that were deleted
+        :param table: the table's name.
+        :param where: decides which rows go; ``None`` deletes all.
+        :return: the number of rows deleted.
         """
         return self.table(table).delete(where)

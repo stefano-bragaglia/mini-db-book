@@ -1,25 +1,29 @@
-"""Exceptions raised by minidb."""
+"""Define the exceptions that minidb raises on purpose."""
 
 
 class DatabaseError(Exception):
-    """Base class for every error minidb raises on purpose."""
+    """Signal any error that minidb raises deliberately.
+
+    Catching it catches everything the database rejected, but none of the
+    application's own bugs.
+    """
 
 
 class SchemaError(DatabaseError):
-    """A table or column does not exist, or a definition is invalid."""
+    """Signal that a table or column doesn't exist, or a definition is invalid."""
 
 
 class ConstraintError(DatabaseError):
-    """Data was rejected because it violates a rule of the schema."""
+    """Signal that data was rejected because it breaks a rule of the schema."""
 
 
 class DomainError(ConstraintError):
-    """A value does not belong to its column's type (domain)."""
+    """Signal that a value doesn't belong to its column's type (domain)."""
 
 
-class NotNullViolation(ConstraintError):
-    """A NOT NULL column received NULL."""
+class NotNullError(ConstraintError):
+    """Signal that a NOT NULL column received NULL."""
 
 
-class CheckViolation(ConstraintError):
-    """A CHECK constraint evaluated to false."""
+class CheckError(ConstraintError):
+    """Signal that a CHECK constraint evaluated to false."""

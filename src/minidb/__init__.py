@@ -1,11 +1,12 @@
-"""minidb: a small relational database, built in the book."""
+"""Build a small relational database, one chapter at a time."""
+
 from minidb import normalizers
 from minidb.database import Database
-from minidb.errors import CheckViolation
+from minidb.errors import CheckError
 from minidb.errors import ConstraintError
 from minidb.errors import DatabaseError
 from minidb.errors import DomainError
-from minidb.errors import NotNullViolation
+from minidb.errors import NotNullError
 from minidb.errors import SchemaError
 from minidb.schema import Check
 from minidb.schema import Column
@@ -19,10 +20,23 @@ from minidb.types import Text
 from minidb.types import Timestamp
 
 __all__ = [
-    "Database", "DatabaseError", "SchemaError", "ConstraintError", "DomainError",
-    "NotNullViolation", "CheckViolation",
-    "Column", "Check", "TableSchema",
-    "Integer", "Real", "Text", "Boolean", "Numeric", "Date", "Timestamp",
+    "Boolean",
+    "Check",
+    "CheckError",
+    "Column",
+    "ConstraintError",
+    "Database",
+    "DatabaseError",
+    "Date",
+    "DomainError",
+    "Integer",
+    "NotNullError",
+    "Numeric",
+    "Real",
+    "SchemaError",
+    "TableSchema",
+    "Text",
+    "Timestamp",
     "normalizers",
 ]
 
