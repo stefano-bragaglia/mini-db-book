@@ -21,7 +21,7 @@ class Index(Protocol):
 
     kind: ClassVar[str]
     name: str
-    column: tuple[str, ...]
+    columns: tuple[str, ...]
     unique: bool
 
     def key_of(self, row: Mapping[str, Value | None]) -> Key | None:
