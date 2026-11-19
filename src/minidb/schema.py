@@ -1,20 +1,21 @@
 """Declare tables: their columns, and the pipeline that prepares rows."""
+
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Mapping
 from copy import replace
 from dataclasses import dataclass
 from dataclasses import field
 from types import MappingProxyType
-from typing import Iterable
-from typing import Literal
 from typing import TYPE_CHECKING
+from typing import Literal
 
+from minidb.errors import CheckError
+from minidb.errors import DomainError
 from minidb.errors import NotNullError
+from minidb.errors import SchemaError
 
 if TYPE_CHECKING:
-    from minidb.errors import CheckError
-    from minidb.errors import DomainError
-    from minidb.errors import SchemaError
     from minidb.types import Type
     from minidb.values import Row
     from minidb.values import Value
