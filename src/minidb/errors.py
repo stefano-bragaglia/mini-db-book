@@ -27,3 +27,7 @@ class NotNullError(ConstraintError):
 
 class CheckError(ConstraintError):
     """Signal that a CHECK constraint evaluated to false."""
+
+
+class UniqueError(ConstraintError):
+    """Signal that a PRIMARY KEY or UNIQUE constraint would be violated."""

@@ -1,19 +1,19 @@
 """Declare tables: their columns, and the pipeline that prepares rows."""
-
+from collections.abc import Callable
+from collections.abc import Mapping
+from copy import replace
 from dataclasses import dataclass
 from dataclasses import field
 from types import MappingProxyType
+from typing import Iterable
 from typing import TYPE_CHECKING
 
-from minidb.errors import CheckError
-from minidb.errors import DomainError
 from minidb.errors import NotNullError
-from minidb.errors import SchemaError
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-    from collections.abc import Mapping
-
+    from minidb.errors import CheckError
+    from minidb.errors import DomainError
+    from minidb.errors import SchemaError
     from minidb.types import Type
     from minidb.values import Row
     from minidb.values import Value
@@ -91,33 +91,43 @@ class Check:
 # src/minidb/schema.py (replace TableSchema)
 @dataclass(frozen=True)
 class TableSchema:
-    """Declare a table and run the constraint pipeline that prepares its rows.
+    """Declare a table, its keys, and the constraint pipeline for its rows.
+
+    Primary-key columns are made NOT NULL automatically.
 
     >>> from minidb.types import Integer
-    >>> schema = TableSchema("t", (Column("n", Integer(), nullable=False, default=1),))
-    >>> schema.prepare_row({})
-    {'n': 1}
-    >>> schema.prepare_row({"n": None})
-    Traceback (most recent call last):
-      ...
-    minidb.errors.NotNullError: t.n may not be NULL
+    >>> schema = TableSchema("t", (Column("id", Integer()),), primary_key=("id",))
+    >>> schema.column("id").nullable
+    False
 
     :param name: the table's name.
     :param columns: its columns, in order.
     :param checks: its row-level CHECK constraints; none by default.
-    :raises SchemaError: if two columns share a name.
+    :param primary_key: the primary-key columns; ``()`` (the default) for none.
+    :param unique: the column tuples of its UNIQUE constraints; none by default.
+    :raises SchemaError: if two columns share a name, or a key names an
+        unknown column.
     """
 
     name: str
     columns: tuple[Column, ...]
     checks: tuple[Check, ...] = ()
+    primary_key: tuple[str, ...] = ()
+    unique: tuple[tuple[str, ...], ...] = ()
     by_name: Mapping[str, Column] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         names = [c.name for c in self.columns]
         if len(set(names)) != len(names):
             raise SchemaError(f"duplicate column names in {self.name!r}")
-        object.__setattr__(self, "by_name", {c.name: c for c in self.columns})
+        for key in (self.primary_key, *self.unique):
+            if missing := set(key) - set(names):
+                raise SchemaError(f"{self.name}: key uses unknown column(s) {sorted(missing)}")
+        # entity integrity: primary-key columns are implicitly NOT NULL
+        pk = set(self.primary_key)
+        columns = tuple(replace(c, nullable=False) if c.name in pk else c for c in self.columns)
+        object.__setattr__(self, "columns", columns)
+        object.__setattr__(self, "by_name", {c.name: c for c in columns})
 
     @property
     def column_names(self) -> tuple[str, ...]:
@@ -191,3 +201,15 @@ class TableSchema:
         for check in self.checks:
             if check.predicate(view) is False:
                 raise CheckError(f"{self.name}: check {check.name!r} failed")
+
+
+def as_key(columns: str | Iterable[str]) -> tuple[str, ...]:
+    """Turn one column name or several into a tuple of names.
+
+    >>> as_key("id"), as_key(["a", "b"])
+    (('id',), ('a', 'b'))
+
+    :param columns: a column name, or an iterable of them.
+    :return: the names as a tuple.
+    """
+    return (columns,) if isinstance(columns, str) else tuple(columns)

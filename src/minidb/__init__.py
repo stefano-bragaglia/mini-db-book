@@ -8,6 +8,7 @@ from minidb.errors import DatabaseError
 from minidb.errors import DomainError
 from minidb.errors import NotNullError
 from minidb.errors import SchemaError
+from minidb.errors import UniqueError
 from minidb.schema import Check
 from minidb.schema import Column
 from minidb.schema import TableSchema
@@ -37,6 +38,7 @@ __all__ = [
     "TableSchema",
     "Text",
     "Timestamp",
+    "UniqueError",
     "normalizers",
 ]
 
