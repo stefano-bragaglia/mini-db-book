@@ -4,6 +4,8 @@ Every write is planned first (:mod:`minidb.changes`) and then applied by
 :meth:`Database.apply`, the only method that modifies tables.
 """
 
+import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -14,9 +16,11 @@ from minidb.query import Query
 from minidb.schema import TableSchema
 from minidb.schema import as_key
 from minidb.table import Table
+from minidb.uow import TransactionError
 from minidb.uow import UnitOfWork
 
 if TYPE_CHECKING:
+    from collections.abc import Generator
     from collections.abc import Mapping
     from collections.abc import Sequence
 
@@ -34,6 +38,8 @@ class Database:
     def __init__(self) -> None:
         self.tables: dict[str, Table] = {}
         self.foreign_keys: list[ForeignKey] = []
+        self._lock = threading.Lock()
+        self._local = threading.local()  # .uow: this thread's active unit of work
 
     # -- schema --------------------------------------------------------------------
     def create_table(
@@ -147,7 +153,8 @@ class Database:
         :param rowid: the row to fetch.
         :return: the row, or ``None``.
         """
-        return self.table(table).get(rowid)
+        with self.reading():
+            return self.table(table).get(rowid)
 
     def select(self, table: str, where: Where = None) -> list[Row]:
         """Return the rows of ``table`` matching ``where``; see :meth:`Table.match`.
@@ -156,7 +163,8 @@ class Database:
         :param where: a predicate, a dict of equalities, or ``None`` for all rows.
         :return: copies of the matching rows.
         """
-        return self.table(table).select(where)
+        with self.reading():
+            return self.table(table).select(where)
 
     def query(self, table: str, alias: str | None = None) -> Query:
         """Start a query on ``table``; see :class:`Query`.
@@ -221,3 +229,46 @@ class Database:
         :return: a new, active unit of work.
         """
         return UnitOfWork(self, deferred=deferred)
+
+    # -- concurrency control ------------------------------------------------------------
+    def active_unit_of_work(self) -> UnitOfWork | None:
+        """Return the calling thread's active unit of work, if it has one.
+
+        :return: the unit of work, or ``None``.
+        """
+        uow: UnitOfWork | None = getattr(self._local, "uow", None)
+        return uow
+
+    def begin(self, uow: UnitOfWork) -> None:
+        """Wait for exclusive access on behalf of a new unit of work.
+
+        Units of work call this themselves; applications don't need to.
+
+        :param uow: the unit of work that is starting.
+        :raises TransactionError: if the thread already has an active one.
+        """
+        if self.active_unit_of_work() is not None:
+            raise TransactionError("this thread already has an active unit of work")
+        self._lock.acquire()
+        self._local.uow = uow
+
+    def end(self, uow: UnitOfWork) -> None:  # noqa: ARG002 - the lock is the same for every unit of work
+        """Release the lock when a unit of work commits or rolls back.
+
+        :param uow: the unit of work that is finishing.
+        """
+        self._local.uow = None
+        self._lock.release()
+
+    @contextmanager
+    def reading(self) -> Generator[Database]:
+        """Hold the lock for one read outside any unit of work.
+
+        :return: a context manager that yields the database.
+        :raises TransactionError: if the thread has an active unit of work,
+            which must be used for reading instead.
+        """
+        if self.active_unit_of_work() is not None:
+            raise TransactionError("inside a unit of work, read through the unit of work")
+        with self._lock:
+            yield self

@@ -5,6 +5,7 @@ and the shared tables are only touched when :meth:`UnitOfWork.commit`
 applies the transaction's net changes in one step.
 """
 
+from contextlib import nullcontext
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import Self
@@ -182,6 +183,7 @@ class UnitOfWork:
         self._changes: list[Change] = []
         self._identity: dict[tuple[str, int], Record] = {}
         self._snapshots: dict[tuple[str, int], Row] = {}
+        db.begin(self)
 
     # -- the planner "state" interface ---------------------------------------------------
     @property
@@ -331,10 +333,10 @@ class UnitOfWork:
 
     # -- finishing ---------------------------------------------------------------------
     def commit(self) -> None:
-        """Flush, run the deferred checks if any, and apply the net changes.
+        """Flush, run the deferred checks if any, apply the net changes, and release the lock.
 
         :raises ConstraintError: if a deferred check fails; the unit of
-            work then stays active.
+            work then stays active and keeps the lock.
         :raises TransactionError: if the unit of work is no longer active.
         """
         self._require_active()
@@ -343,9 +345,10 @@ class UnitOfWork:
             ch.check_deferred(self, self._changes)
         self.db.apply(ch.net_changes(self._changes))
         self.state = "committed"
+        self.db.end(self)
 
     def rollback(self) -> None:
-        """Forget every change: the shared tables were never touched.
+        """Forget every change and release the lock.
 
         :raises TransactionError: if the unit of work is no longer active.
         """
@@ -353,8 +356,8 @@ class UnitOfWork:
         self._views.clear()
         self._changes.clear()
         self._identity.clear()
-        self._snapshots.clear()
         self.state = "rolled back"
+        self.db.end(self)
 
     def _require_active(self) -> None:
         if self.state != "active":
@@ -376,3 +379,10 @@ class UnitOfWork:
         except BaseException:
             self.rollback()  # a failed commit must not stay open
             raise
+
+    def reading(self) -> nullcontext[Self]:
+        """Return a context manager for reads, which does nothing: we hold the lock.
+
+        :return: a context manager that yields the unit of work.
+        """
+        return nullcontext(self)

@@ -17,6 +17,7 @@ from minidb.operators import Sort
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from contextlib import AbstractContextManager
 
     from minidb.operators import Accumulator
     from minidb.operators import AggregateFunction
@@ -30,11 +31,16 @@ if TYPE_CHECKING:
     from minidb.values import Value
 
 
+# src/minidb/query.py (replace QueryState)
 class QueryState(Protocol):
-    """Describe where a query finds its tables: a database, for now."""
+    """Describe where a query finds its tables, and how it protects its reads."""
 
     def table(self, name: str) -> Source:
         """Return the table (or view) called ``name``."""
+        ...
+
+    def reading(self) -> AbstractContextManager[object]:
+        """Return a context manager to hold while the query reads."""
         ...
 
 
@@ -174,21 +180,25 @@ class Query:
 
     # -- running ----------------------------------------------------------------
     def __iter__(self) -> Iterator[Row]:
-        return iter(self.plan())
+        with self.state.reading():
+            rows = list(self.plan())  # materialize while protected
+        return iter(rows)
 
     def all(self) -> list[dict[str, Value | None]]:
         """Run the query and return every row, as a plain dict.
 
         :return: the result rows.
         """
-        return [dict(row) for row in self.plan()]
+        with self.state.reading():
+            return [dict(row) for row in self.plan()]
 
     def first(self) -> dict[str, Value | None] | None:
         """Run the query and return its first row.
 
         :return: the first row, or ``None`` if there are no rows.
         """
-        return next((dict(row) for row in self.limit(1).plan()), None)
+        rows = self.limit(1).all()
+        return rows[0] if rows else None
 
     def explain(self) -> str:
         """Describe the plan, one operator per line.
