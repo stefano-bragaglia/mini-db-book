@@ -175,9 +175,10 @@ class UnitOfWork:
         ``False`` by default.
     """
 
-    def __init__(self, db: Database, *, deferred: bool = False) -> None:
+    def __init__(self, db: Database, *, deferred: bool = False, readonly: bool = False) -> None:
         self.db = db
         self.deferred = deferred
+        self.readonly = readonly
         self.state = "active"
         self._views: dict[str, TableView] = {}
         self._changes: list[Change] = []
@@ -211,9 +212,10 @@ class UnitOfWork:
         :param values: the new row's values, by column name.
         :return: the new rowid.
         :raises ConstraintError: if the row breaks a constraint.
-        :raises TransactionError: if the unit of work is no longer active.
+        :raises TransactionError: if the unit of work is no longer active,
+            or is read-only.
         """
-        self._require_active()
+        self._require_active(writing=True)
         self.flush()
         changes = ch.plan_insert(self, table, values, check=not self.deferred)
         self._record(changes)
@@ -227,9 +229,10 @@ class UnitOfWork:
         :param where: which rows change; ``None`` (the default) for all.
         :return: the number of rows changed.
         :raises ConstraintError: if a new row breaks a constraint.
-        :raises TransactionError: if the unit of work is no longer active.
+        :raises TransactionError: if the unit of work is no longer active,
+            or is read-only.
         """
-        self._require_active()
+        self._require_active(writing=True)
         self.flush()
         planned = ch.plan_update(self, table, changes, where, check=not self.deferred)
         self._record(planned)
@@ -242,9 +245,10 @@ class UnitOfWork:
         :param where: which rows go; ``None`` (the default) for all.
         :return: the number of rows deleted from ``table`` itself.
         :raises ForeignKeyError: if a ``restrict`` reference forbids it.
-        :raises TransactionError: if the unit of work is no longer active.
+        :raises TransactionError: if the unit of work is no longer active,
+            or is read-only.
         """
-        self._require_active()
+        self._require_active(writing=True)
         self.flush()
         planned = ch.plan_delete(self, table, where, check=not self.deferred)
         self._record(planned)
@@ -324,10 +328,13 @@ class UnitOfWork:
         """Turn modifications of loaded records into planned updates.
 
         :raises ConstraintError: if a modified record breaks a constraint.
+        :raises TransactionError: if a record was modified in a read-only
+            unit of work.
         """
         for key, record in list(self._identity.items()):
             before = self._snapshots[key]
             if record != before:
+                self._require_active(writing=True)
                 diff = {c: v for c, v in record.items() if before.get(c, _MISSING) != v}
                 self._record(ch.plan_update(self, key[0], diff, rowids=[key[1]], check=not self.deferred))
 
@@ -359,9 +366,11 @@ class UnitOfWork:
         self.state = "rolled back"
         self.db.end(self)
 
-    def _require_active(self) -> None:
+    def _require_active(self, *, writing: bool = False) -> None:
         if self.state != "active":
             raise TransactionError(f"unit of work is already {self.state}")
+        if writing and self.readonly:
+            raise TransactionError("cannot write in a read-only unit of work")
 
     def __enter__(self) -> Self:
         return self

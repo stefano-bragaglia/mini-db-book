@@ -4,14 +4,17 @@ Every write is planned first (:mod:`minidb.changes`) and then applied by
 :meth:`Database.apply`, the only method that modifies tables.
 """
 
+from typing import Generator as Generator_1
 import threading
 from contextlib import contextmanager
 from dataclasses import replace
+from typing import Iterator
 from typing import TYPE_CHECKING
 
 from minidb import changes as ch
 from minidb.errors import DatabaseError
 from minidb.errors import SchemaError
+from minidb.locks import FairRWLock
 from minidb.query import Query
 from minidb.schema import TableSchema
 from minidb.schema import as_key
@@ -25,6 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from minidb.changes import Change
+    from minidb.locks import RWLock
     from minidb.schema import Check
     from minidb.schema import Column
     from minidb.schema import ForeignKey
@@ -35,10 +39,10 @@ if TYPE_CHECKING:
 class Database:
     """Hold tables and the foreign keys between them, and run CRUD on them."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, lock: RWLock | None = None) -> None:
         self.tables: dict[str, Table] = {}
         self.foreign_keys: list[ForeignKey] = []
-        self._lock = threading.Lock()
+        self._lock: RWLock = lock if lock is not None else FairRWLock()
         self._local = threading.local()  # .uow: this thread's active unit of work
 
     # -- schema --------------------------------------------------------------------
@@ -221,14 +225,16 @@ class Database:
             else:
                 self.tables[c.table].put(c.rowid, c.after)
 
-    def unit_of_work(self, *, deferred: bool = False) -> UnitOfWork:
+    def unit_of_work(self, *, deferred: bool = False, readonly: bool = False) -> UnitOfWork:
         """Start a transaction; see :class:`UnitOfWork`.
 
         :param deferred: whether to check multi-row constraints only at
             commit; ``False`` by default.
+        :param readonly: whether the transaction only reads, and so may
+            share the lock; ``False`` by default.
         :return: a new, active unit of work.
         """
-        return UnitOfWork(self, deferred=deferred)
+        return UnitOfWork(self, deferred=deferred, readonly=readonly)
 
     # -- concurrency control ------------------------------------------------------------
     def active_unit_of_work(self) -> UnitOfWork | None:
@@ -240,7 +246,7 @@ class Database:
         return uow
 
     def begin(self, uow: UnitOfWork) -> None:
-        """Wait for exclusive access on behalf of a new unit of work.
+        """Take the lock on behalf of a new unit of work: shared if it is read-only.
 
         Units of work call this themselves; applications don't need to.
 
@@ -249,26 +255,31 @@ class Database:
         """
         if self.active_unit_of_work() is not None:
             raise TransactionError("this thread already has an active unit of work")
-        self._lock.acquire()
+        if uow.readonly:
+            self._lock.acquire_read()
+        else:
+            self._lock.acquire_write()
         self._local.uow = uow
 
-    def end(self, uow: UnitOfWork) -> None:  # noqa: ARG002 - the lock is the same for every unit of work
+    def end(self, uow: UnitOfWork) -> None:
         """Release the lock when a unit of work commits or rolls back.
 
         :param uow: the unit of work that is finishing.
         """
         self._local.uow = None
-        self._lock.release()
+        if uow.readonly:
+            self._lock.release_read()
+        else:
+            self._lock.release_write()
 
     @contextmanager
-    def reading(self) -> Generator[Database]:
-        """Hold the lock for one read outside any unit of work.
+    def reading(self) -> Generator_1[Database]:
+        """Hold the lock in shared mode for one read outside any unit of work.
 
         :return: a context manager that yields the database.
-        :raises TransactionError: if the thread has an active unit of work,
-            which must be used for reading instead.
+        :raises TransactionError: if the thread has an active unit of work.
         """
         if self.active_unit_of_work() is not None:
             raise TransactionError("inside a unit of work, read through the unit of work")
-        with self._lock:
+        with self._lock.read():
             yield self
