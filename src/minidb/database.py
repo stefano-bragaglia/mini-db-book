@@ -6,8 +6,9 @@ from typing import TYPE_CHECKING
 from minidb.errors import DatabaseError
 from minidb.errors import ForeignKeyError
 from minidb.errors import SchemaError
-from minidb.schema import as_key
+from minidb.query import Query
 from minidb.schema import TableSchema
+from minidb.schema import as_key
 from minidb.table import Table
 
 if TYPE_CHECKING:
@@ -37,14 +38,14 @@ class Database:
 
     # -- schema -----------------------------------------------------------------
     def create_table(
-            self,
-            name: str,
-            columns: Sequence[Column],
-            *,
-            primary_key: str | Sequence[str] = (),
-            unique: Sequence[str | Sequence[str]] = (),
-            checks: Sequence[Check] = (),
-            foreign_keys: Sequence[ForeignKey] = (),
+        self,
+        name: str,
+        columns: Sequence[Column],
+        *,
+        primary_key: str | Sequence[str] = (),
+        unique: Sequence[str | Sequence[str]] = (),
+        checks: Sequence[Check] = (),
+        foreign_keys: Sequence[ForeignKey] = (),
     ) -> Table:
         """Create an empty table and return it.
 
@@ -281,7 +282,7 @@ class Database:
         return deleted
 
     def _restrict_or_null(
-            self, fk: ForeignKey, parent_row: Row, survivors: list[int], nulled: dict[RowRef, Row]
+        self, fk: ForeignKey, parent_row: Row, survivors: list[int], nulled: dict[RowRef, Row]
     ) -> None:
         """Refuse the delete for ``restrict``, or plan the updates for ``set null``."""
         if fk.on_delete == "restrict":
@@ -293,3 +294,21 @@ class Database:
         for c in survivors:
             base = nulled.get((fk.table, c), child.rows[c])
             nulled[fk.table, c] = child.schema.prepare_row(dict.fromkeys(fk.columns), base=base)
+
+    def query(self, table: str, alias: str | None = None) -> Query:
+        """Start a query on ``table``.
+
+        >>> from minidb.schema import Column
+        >>> from minidb.types import Integer
+        >>> db = Database()
+        >>> _ = db.create_table("t", [Column("n", Integer())])
+        >>> for n in (3, 1, 2):
+        ...     _ = db.insert("t", {"n": n})
+        >>> [row["n"] for row in db.query("t").order_by("-n")]
+        [3, 2, 1]
+
+        :param table: the first table.
+        :param alias: its alias; ``None`` (the default) uses its name.
+        :return: a query to extend and run.
+        """
+        return Query(self, table, alias)

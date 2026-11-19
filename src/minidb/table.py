@@ -8,19 +8,19 @@ check nothing. The operations (:meth:`Table.insert`, :meth:`Table.update_rows`,
 """
 
 from collections.abc import Callable
+from collections.abc import Iterable
 from collections.abc import Iterator
 from collections.abc import Mapping
 from types import MappingProxyType
-from typing import Iterable
 from typing import TYPE_CHECKING
 
+from minidb.errors import SchemaError
 from minidb.errors import UniqueError
 from minidb.index import HashIndex
 
 if TYPE_CHECKING:
-    from minidb import SchemaError
-    from minidb.index import Key
     from minidb.index import Index
+    from minidb.index import Key
     from minidb.schema import TableSchema
     from minidb.values import Row
     from minidb.values import Value
@@ -75,7 +75,6 @@ class Table:
         :raises UniqueError: if ``unique`` and existing rows share a key.
         """
         if name in self.indexes:
-            from minidb import SchemaError
             raise SchemaError(f"{self.name}: index {name!r} already exists")
         columns = tuple(columns)
         for c in columns:
