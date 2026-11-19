@@ -6,11 +6,13 @@ from minidb.errors import CheckError
 from minidb.errors import ConstraintError
 from minidb.errors import DatabaseError
 from minidb.errors import DomainError
+from minidb.errors import ForeignKeyError
 from minidb.errors import NotNullError
 from minidb.errors import SchemaError
 from minidb.errors import UniqueError
 from minidb.schema import Check
 from minidb.schema import Column
+from minidb.schema import ForeignKey
 from minidb.schema import TableSchema
 from minidb.types import Boolean
 from minidb.types import Date
@@ -30,6 +32,8 @@ __all__ = [
     "DatabaseError",
     "Date",
     "DomainError",
+    "ForeignKey",
+    "ForeignKeyError",
     "Integer",
     "NotNullError",
     "Numeric",

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from types import MappingProxyType
 from typing import Iterable
+from typing import Literal
 from typing import TYPE_CHECKING
 
 from minidb.errors import NotNullError
@@ -20,6 +21,9 @@ if TYPE_CHECKING:
 
 type Normalizer = Callable[[Value], Value]
 type RowCheck = Callable[[Mapping[str, Value | None]], object]
+
+type OnDelete = Literal["restrict", "cascade", "set null"]
+ON_DELETE_ACTIONS: tuple[OnDelete, ...] = ("restrict", "cascade", "set null")
 
 
 @dataclass(frozen=True)
@@ -213,3 +217,61 @@ def as_key(columns: str | Iterable[str]) -> tuple[str, ...]:
     :return: the names as a tuple.
     """
     return (columns,) if isinstance(columns, str) else tuple(columns)
+
+
+@dataclass(frozen=True)
+class ForeignKey:
+    """Declare that ``table.columns`` must match ``ref_table.ref_columns``, or be NULL.
+
+    >>> fk = ForeignKey(("user_id",), "users", ("id",), table="orders")
+    >>> fk.name, fk.parent_key({"user_id": 7}), fk.child_key({"id": 7})
+    ('fk_orders_user_id', {'id': 7}, {'user_id': 7})
+
+    :param columns: the referencing columns of the child table; a single
+        name is also accepted.
+    :param ref_table: the referenced (parent) table.
+    :param ref_columns: the referenced columns, which must form a key;
+        ``()`` (the default) means the parent's primary key.
+    :param on_delete: what deleting a referenced row does: ``"restrict"``
+        (the default) refuses, ``"cascade"`` deletes the children too, and
+        ``"set null"`` sets their foreign-key columns to NULL.
+    :param table: the child table; :meth:`Database.create_table` fills it in.
+    :raises SchemaError: if ``on_delete`` is not one of the three actions.
+    """
+
+    columns: tuple[str, ...]
+    ref_table: str
+    ref_columns: tuple[str, ...] = ()
+    on_delete: OnDelete = "restrict"
+    table: str = ""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "columns", as_key(self.columns))
+        object.__setattr__(self, "ref_columns", as_key(self.ref_columns))
+        if self.on_delete not in ON_DELETE_ACTIONS:
+            raise SchemaError(f"on_delete must be one of {ON_DELETE_ACTIONS}")
+
+    @property
+    def name(self) -> str:
+        """Return the constraint's name, derived from the child table and columns."""
+        return f"fk_{self.table}_{'_'.join(self.columns)}"
+
+    def parent_key(self, child_row: Mapping[str, Value | None]) -> dict[str, Value | None] | None:
+        """Return ``{ref_column: value}`` for the parent ``child_row`` points at.
+
+        :param child_row: a row of the child table.
+        :return: the parent's key, or ``None`` if any referencing value is
+            NULL: such a row references nothing (SQL's ``MATCH SIMPLE``).
+        """
+        values = [child_row[c] for c in self.columns]
+        if any(v is None for v in values):
+            return None
+        return dict(zip(self.ref_columns, values, strict=True))
+
+    def child_key(self, parent_row: Mapping[str, Value | None]) -> dict[str, Value | None]:
+        """Return ``{column: value}`` that the children of ``parent_row`` have.
+
+        :param parent_row: a row of the parent table.
+        :return: the key to look up in the child table.
+        """
+        return {c: parent_row[r] for c, r in zip(self.columns, self.ref_columns, strict=True)}

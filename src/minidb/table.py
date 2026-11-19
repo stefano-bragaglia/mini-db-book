@@ -18,6 +18,7 @@ from minidb.errors import UniqueError
 from minidb.index import HashIndex
 
 if TYPE_CHECKING:
+    from minidb import SchemaError
     from minidb.index import Key
     from minidb.index import Index
     from minidb.schema import TableSchema
@@ -273,3 +274,15 @@ class Table:
         :return: the number of rows deleted.
         """
         return self.delete_rows(self.match(where))
+
+    def lookup(self, key: Mapping[str, Value | None]) -> set[int]:
+        """Return the rowids whose columns equal ``key``, through an index.
+
+        :param key: ``{column: value}``; the order of the columns doesn't matter.
+        :return: the matching rowids, as a new set.
+        :raises SchemaError: if no index covers exactly these columns.
+        """
+        index = self.index_on(key)
+        if index is None:
+            raise SchemaError(f"{self.name}: no index on {sorted(key)}")
+        return index.lookup(tuple(key[c] for c in index.columns))

@@ -31,3 +31,7 @@ class CheckError(ConstraintError):
 
 class UniqueError(ConstraintError):
     """Signal that a PRIMARY KEY or UNIQUE constraint would be violated."""
+
+
+class ForeignKeyError(ConstraintError):
+    """Signal a reference to a missing row, or a delete that would orphan rows."""
