@@ -104,53 +104,77 @@ class Change:
 
 
 # -- the three operations ----------------------------------------------------------------
-def plan_insert(state: State, table: str, values: Mapping[str, object]) -> list[Change]:
+def plan_insert(state: State, table: str, values: Mapping[str, object], *, check: bool = True) -> list[Change]:
     """Plan inserting one row.
 
     :param state: where to read the current data.
     :param table: the table's name.
     :param values: the new row's values, by column name.
+    :param check: whether to check uniqueness and references now;
+        ``True`` by default. Single-row constraints are always checked.
     :return: the single insert change, with a newly allocated rowid.
     :raises ConstraintError: if the row breaks a constraint.
     """
     t = state.table(table)
     row = t.schema.prepare_row(values)
-    check_unique(t, [(None, row)])
-    check_parents_exist(state, t, [row])
+    if check:
+        check_unique(t, [(None, row)])
+        check_parents_exist(state, t, [row])
     return [Change(table, t.new_rowid(), None, row)]
 
 
-def plan_update(state: State, table: str, changes: Mapping[str, object], where: Where = None) -> list[Change]:
-    """Plan setting ``changes`` on every row matching ``where``.
+def plan_update(
+    state: State,
+    table: str,
+    changes: Mapping[str, object],
+    where: Where = None,
+    *,
+    rowids: Iterable[int] | None = None,
+    check: bool = True,
+) -> list[Change]:
+    """Plan setting ``changes`` on some rows.
 
     :param state: where to read the current data.
     :param table: the table's name.
     :param changes: the new values, by column name.
     :param where: which rows change; ``None`` (the default) for all.
-    :return: one update change per matching row.
+    :param rowids: the exact rows to change, instead of ``where``; ``None``
+        (the default) to use ``where``.
+    :param check: whether to check uniqueness and references now;
+        ``True`` by default.
+    :return: one update change per row.
     :raises ConstraintError: if a new row breaks a constraint.
     """
     t = state.table(table)
-    old = {rid: t.row(rid) for rid in t.match(where)}
+    targets = t.match(where) if rowids is None else rowids
+    old = {rid: t.row(rid) for rid in targets}
     new = {rid: t.schema.prepare_row(changes, base=row) for rid, row in old.items()}
-    check_unique(t, list(new.items()))
-    check_parents_exist(state, t, new.values())
-    check_no_orphans(state, t, old, new)
+    if check:
+        check_unique(t, list(new.items()))
+        check_parents_exist(state, t, new.values())
+        check_no_orphans(state, t, old, new)
     return [Change(table, rid, old[rid], new[rid]) for rid in new]
 
 
-def plan_delete(state: State, table: str, where: Where = None) -> list[Change]:
+def plan_delete(
+    state: State, table: str, where: Where = None, *, rowids: Iterable[int] | None = None, check: bool = True
+) -> list[Change]:
     """Plan a delete and everything it implies: cascades and SET NULL updates.
 
     :param state: where to read the current data.
     :param table: the table's name.
     :param where: which rows go; ``None`` (the default) for all.
+    :param rowids: the exact rows to delete, instead of ``where``; ``None``
+        (the default) to use ``where``.
+    :param check: whether to refuse ``restrict``-ed deletes now; ``True``
+        by default. Cascades and SET NULL are actions, so they always run.
     :return: the delete changes, followed by any SET NULL updates.
-    :raises ForeignKeyError: if a ``restrict`` reference forbids the delete.
-    :raises ConstraintError: if a ``set null`` makes a row invalid.
+    :raises ForeignKeyError: if ``check`` and a ``restrict`` reference
+        forbids the delete.
     """
-    deleted = _cascade(state, table, state.table(table).match(where))
-    nulled = _nulled_children(state, deleted)
+    t = state.table(table)
+    deleted = _cascade(state, table, t.match(where) if rowids is None else rowids)
+    nulled = _nulled_children(state, deleted, check=check)
     return [Change(n, rid, row, None) for (n, rid), row in deleted.items()] + [
         Change(n, rid, b, a) for (n, rid), (b, a) in nulled.items()
     ]
@@ -171,30 +195,39 @@ def _cascade(state: State, table: str, rowids: Iterable[int]) -> dict[RowRef, Ro
     return deleted
 
 
-def _nulled_children(state: State, deleted: dict[RowRef, Row]) -> dict[RowRef, tuple[Row, Row]]:
+def _nulled_children(state: State, deleted: dict[RowRef, Row], *, check: bool) -> dict[RowRef, tuple[Row, Row]]:
     """Restrict or null every child that survives the cascade."""
     nulled: dict[RowRef, tuple[Row, Row]] = {}
     for (name, _), row in deleted.items():
         for fk in references_to(state, name):
             survivors = [c for c in children(state, fk, row) if (fk.table, c) not in deleted]
             if survivors:
-                _restrict_or_null(state, fk, row, survivors, nulled)
+                _restrict_or_null(state, fk, row, survivors, nulled, check=check)
     return nulled
 
 
 def _restrict_or_null(
-    state: State, fk: ForeignKey, parent_row: Row, survivors: list[int], nulled: dict[RowRef, tuple[Row, Row]]
+    state: State,
+    fk: ForeignKey,
+    parent_row: Row,
+    survivors: list[int],
+    nulled: dict[RowRef, tuple[Row, Row]],
+    *,
+    check: bool,
 ) -> None:
     if fk.on_delete == "restrict":
-        raise ForeignKeyError(
-            f"{fk.name}: {fk.ref_table} row {fk.child_key(parent_row)} is still "
-            f"referenced by {len(survivors)} {fk.table} row(s)"
-        )
-    child = state.table(fk.table)
-    for c in survivors:
-        before = child.row(c)
-        base = nulled.get((fk.table, c), (before, before))[1]
-        nulled[fk.table, c] = (before, child.schema.prepare_row(dict.fromkeys(fk.columns), base=base))
+        if check:
+            raise ForeignKeyError(
+                f"{fk.name}: {fk.ref_table} row {fk.child_key(parent_row)} is still "
+                f"referenced by {len(survivors)} {fk.table} row(s)"
+            )
+        return
+    if fk.on_delete == "set null":
+        child = state.table(fk.table)
+        for c in survivors:
+            before = child.row(c)
+            base = nulled.get((fk.table, c), (before, before))[1]
+            nulled[fk.table, c] = (before, child.schema.prepare_row(dict.fromkeys(fk.columns), base=base))
 
 
 # -- constraint checks ---------------------------------------------------------------------
@@ -291,3 +324,58 @@ def check_no_orphans(state: State, parent: TableLike, old: dict[int, Row], new: 
                 raise ForeignKeyError(
                     f"{fk.name}: cannot change {parent.name} key {fk.child_key(before)}, it is still referenced"
                 )
+
+
+def net_changes(changes: Iterable[Change]) -> list[Change]:
+    """Collapse a sequence of changes to one per row: its first before, its last after.
+
+    A row inserted and then deleted becomes "nothing happened", and is dropped.
+
+    >>> net_changes([Change("t", 1, None, {"n": 1}), Change("t", 1, {"n": 1}, {"n": 2})])
+    [Change(table='t', rowid=1, before=None, after={'n': 2})]
+
+    :param changes: the changes, in the order they were made.
+    :return: the net changes, in order of each row's first change.
+    """
+    net: dict[RowRef, Change] = {}
+    for c in changes:
+        key = (c.table, c.rowid)
+        net[key] = Change(c.table, c.rowid, net[key].before, c.after) if key in net else c
+    return [c for c in net.values() if c.before is not None or c.after is not None]
+
+
+def check_deferred(state: State, changes: Iterable[Change]) -> None:
+    """Check multi-row constraints over a transaction's net effect, in its final state.
+
+    :param state: the transaction's view, which already includes ``changes``.
+    :param changes: everything the transaction did.
+    :raises UniqueError: if two rows share a unique key.
+    :raises ForeignKeyError: if a reference points at nothing.
+    """
+    by_table: dict[str, list[Change]] = {}
+    for c in net_changes(changes):
+        by_table.setdefault(c.table, []).append(c)
+    for name, cs in by_table.items():
+        t = state.table(name)
+        written = [(c.rowid, c.after) for c in cs if c.after is not None]
+        check_unique(t, [(rid, row) for rid, row in written])
+        check_parents_exist(state, t, [row for _, row in written])
+        for c in cs:
+            if c.before is not None:
+                check_not_dangling(state, t, c.before)
+
+
+def check_not_dangling(state: State, parent: TableLike, old_row: Row) -> None:
+    """Check that, if ``old_row``'s key is gone, nothing still references it.
+
+    :param state: the transaction's view.
+    :param parent: the table ``old_row`` was in.
+    :param old_row: a row that was deleted, or whose key may have changed.
+    :raises ForeignKeyError: if children still reference the vanished key.
+    """
+    for fk in references_to(state, parent.name):
+        key = {r: old_row[r] for r in fk.ref_columns}
+        if any(v is None for v in key.values()) or parent.lookup(key):
+            continue  # NULL key, or a row still has it
+        if children(state, fk, old_row):
+            raise ForeignKeyError(f"{fk.name}: {parent.name} row {key} is gone but still referenced")

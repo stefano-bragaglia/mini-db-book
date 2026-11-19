@@ -28,6 +28,7 @@ from minidb.types import Numeric
 from minidb.types import Real
 from minidb.types import Text
 from minidb.types import Timestamp
+from minidb.uow import Record
 from minidb.uow import TransactionError
 from minidb.uow import UnitOfWork
 
@@ -53,6 +54,7 @@ __all__ = [
     "Numeric",
     "Query",
     "Real",
+    "Record",
     "SchemaError",
     "Sum",
     "TableSchema",

@@ -169,38 +169,38 @@ class Database:
 
     # -- writes ----------------------------------------------------------------------
     def insert(self, table: str, values: Mapping[str, object]) -> int:
-        """Insert a row; see :func:`minidb.changes.plan_insert`.
+        """Insert a row, in a transaction of its own.
 
         :param table: the table's name.
         :param values: the new row's values, by column name.
         :return: the new rowid.
+        :raises ConstraintError: if the row breaks a constraint.
         """
-        changes = ch.plan_insert(self, table, values)
-        self.apply(changes)
-        return changes[0].rowid
+        with self.unit_of_work() as uow:
+            return uow.insert(table, values)
 
     def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
-        """Update rows; see :func:`minidb.changes.plan_update`.
+        """Update rows, in a transaction of its own.
 
         :param table: the table's name.
         :param changes: the new values, by column name.
         :param where: a predicate, a dict of equalities, or ``None`` for all rows.
         :return: the number of rows changed.
+        :raises ConstraintError: if a new row breaks a constraint.
         """
-        planned = ch.plan_update(self, table, changes, where)
-        self.apply(planned)
-        return len(planned)
+        with self.unit_of_work() as uow:
+            return uow.update(table, changes, where)
 
     def delete(self, table: str, where: Where = None) -> int:
-        """Delete rows and their cascades; see :func:`minidb.changes.plan_delete`.
+        """Delete rows and their cascades, in a transaction of its own.
 
         :param table: the table's name.
         :param where: a predicate, a dict of equalities, or ``None`` for all rows.
         :return: the number of rows deleted from ``table`` itself.
+        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
         """
-        planned = ch.plan_delete(self, table, where)
-        self.apply(planned)
-        return sum(1 for c in planned if c.table == table and c.kind == "delete")
+        with self.unit_of_work() as uow:
+            return uow.delete(table, where)
 
     def apply(self, changes: Sequence[Change]) -> None:
         """Write already-validated changes; the only method that modifies tables.
@@ -213,9 +213,11 @@ class Database:
             else:
                 self.tables[c.table].put(c.rowid, c.after)
 
-    def unit_of_work(self) -> UnitOfWork:
+    def unit_of_work(self, *, deferred: bool = False) -> UnitOfWork:
         """Start a transaction; see :class:`UnitOfWork`.
 
+        :param deferred: whether to check multi-row constraints only at
+            commit; ``False`` by default.
         :return: a new, active unit of work.
         """
-        return UnitOfWork(self)
+        return UnitOfWork(self, deferred=deferred)
