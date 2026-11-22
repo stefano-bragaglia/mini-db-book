@@ -39,5 +39,3 @@ class ForeignKeyError(ConstraintError):
 
 class ConflictError(DatabaseError):
     """Signal that a concurrent transaction changed something this one read; retry it."""
-
-

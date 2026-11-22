@@ -1,4 +1,3 @@
-# src/minidb/expr.py
 """Build predicates the planner can look inside: expression trees.
 
 ``col("age") > 30`` is not ``True`` or ``False`` but a :class:`Compare`

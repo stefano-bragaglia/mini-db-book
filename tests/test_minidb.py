@@ -1,4 +1,3 @@
-# tests/test_minidb.py
 """Test minidb: unit, property-based, model-based, concurrency and crash tests."""
 
 import random

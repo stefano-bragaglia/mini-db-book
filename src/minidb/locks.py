@@ -3,11 +3,11 @@
 import threading
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
-from typing import Generator
 from typing import Protocol
 from typing import override
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from contextlib import AbstractContextManager
 
 
@@ -63,7 +63,7 @@ class RWLockBase:
         raise NotImplementedError
 
     @contextmanager
-    def read(self) -> Generator[None]:
+    def read(self) -> Iterator[None]:
         """Hold the lock in shared mode for the duration of a ``with`` block.
 
         :return: a context manager.
@@ -75,7 +75,7 @@ class RWLockBase:
             self.release_read()
 
     @contextmanager
-    def write(self) -> Generator[None]:
+    def write(self) -> Iterator[None]:
         """Hold the lock exclusively for the duration of a ``with`` block.
 
         :return: a context manager.
@@ -85,43 +85,6 @@ class RWLockBase:
             yield
         finally:
             self.release_write()
-
-
-class ReaderPreferringLock(RWLockBase):
-    """Never make readers wait for waiting writers: Courtois et al.'s first problem.
-
-    A steady stream of readers starves writers forever.
-    """
-
-    def __init__(self) -> None:
-        self._cond = threading.Condition()
-        self._readers = 0
-        self._writer = False
-
-    @override
-    def acquire_read(self) -> None:
-        with self._cond:
-            self._cond.wait_for(lambda: not self._writer)
-            self._readers += 1
-
-    @override
-    def release_read(self) -> None:
-        with self._cond:
-            self._readers -= 1
-            if self._readers == 0:
-                self._cond.notify_all()
-
-    @override
-    def acquire_write(self) -> None:
-        with self._cond:
-            self._cond.wait_for(lambda: not self._writer and self._readers == 0)
-            self._writer = True
-
-    @override
-    def release_write(self) -> None:
-        with self._cond:
-            self._writer = False
-            self._cond.notify_all()
 
 
 class ReaderPreferringLock(RWLockBase):

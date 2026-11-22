@@ -1,4 +1,3 @@
-# src/minidb/sql.py
 """Run a useful subset of SQL, compiled onto minidb's own API.
 
 The module has four parts: a tokenizer, syntax-tree dataclasses, a parser

@@ -13,7 +13,6 @@ from minidb.btree import BTreeIndex
 from minidb.errors import SchemaError
 from minidb.errors import UniqueError
 from minidb.index import HashIndex
-from minidb.index import IndexFactory
 from minidb.index import OrderedIndex
 from minidb.index import SortedIndex
 
@@ -24,14 +23,13 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from minidb.index import Index
+    from minidb.index import IndexFactory
     from minidb.schema import TableSchema
     from minidb.values import Row
     from minidb.values import Value
 
 type Predicate = Callable[[Mapping[str, Value | None]], object]
 type Where = Predicate | Mapping[str, object] | None
-
-INDEX_KINDS: dict[str, IndexFactory] = {"hash": HashIndex, "sorted": SortedIndex, "btree": BTreeIndex}
 
 
 class Table:
@@ -66,19 +64,6 @@ class Table:
     def __len__(self) -> int:
         return len(self.rows)
 
-    @property
-    def next_rowid(self) -> int:
-        """Return the rowid the next insert will get."""
-        return self._next_rowid
-
-    def reserve_rowid(self, rowid: int) -> None:
-        """Make sure the counter never hands out ``rowid``, or anything below it.
-
-        :param rowid: a rowid that is in use.
-        """
-        with self._rowid_latch:
-            self._next_rowid = max(self._next_rowid, rowid + 1)
-
     # -- indexes ------------------------------------------------------------------
     def create_index(self, name: str, columns: Iterable[str], *, unique: bool = False, kind: str = "hash") -> Index:
         """Create an index over the existing rows, and maintain it from now on.
@@ -86,15 +71,16 @@ class Table:
         :param name: the index's name.
         :param columns: the indexed columns, in key order.
         :param unique: whether to refuse duplicate keys; ``False`` by default.
-        :param kind: the kind of index, ``"hash"`` by default; see :data:`INDEX_KINDS`.
+        :param kind: ``"hash"`` (the default) or ``"sorted"``; see :data:`INDEX_KINDS`.
         :return: the new index.
-        :raises SchemaError: if the name is taken, the kind is unknown or a column is unknown.
+        :raises SchemaError: if the name is taken, a column is unknown, or
+            the kind is unknown.
         :raises UniqueError: if ``unique`` and existing rows share a key.
         """
         if name in self.indexes:
             raise SchemaError(f"{self.name}: index {name!r} already exists")
         if kind not in INDEX_KINDS:
-            raise SchemaError(f"{self.name}: unknown index kind {kind!r}")
+            raise SchemaError(f"unknown index kind {kind!r}")
         columns = tuple(columns)
         for c in columns:
             self.schema.column(c)
@@ -276,3 +262,22 @@ class Table:
         :return: the matching rows.
         """
         return [dict(self.rows[rid]) for rid in self.match(where)]
+
+    @property
+    def next_rowid(self) -> int:
+        """Return the rowid the next insert will get."""
+        return self._next_rowid
+
+    def reserve_rowid(self, rowid: int) -> None:
+        """Make sure the counter never hands out ``rowid``, or anything below it.
+
+        :param rowid: a rowid that is in use.
+        """
+        with self._rowid_latch:
+            self._next_rowid = max(self._next_rowid, rowid + 1)
+
+
+INDEX_KINDS: dict[str, IndexFactory] = {"hash": HashIndex, "sorted": SortedIndex}
+
+
+INDEX_KINDS["btree"] = BTreeIndex

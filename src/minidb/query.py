@@ -11,7 +11,6 @@ from minidb.operators import Distinct
 from minidb.operators import Filter
 from minidb.operators import Limit
 from minidb.operators import NestedLoopJoin
-from minidb.operators import PlannedSource
 from minidb.operators import Project
 from minidb.operators import Scan
 from minidb.operators import Sort
@@ -25,6 +24,7 @@ if TYPE_CHECKING:
     from minidb.operators import AggregateFunction
     from minidb.operators import JoinKind
     from minidb.operators import Operator
+    from minidb.operators import PlannedSource
     from minidb.operators import Row
     from minidb.operators import RowFunction
     from minidb.operators import RowPredicate

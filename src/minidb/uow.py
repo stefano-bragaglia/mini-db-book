@@ -32,18 +32,6 @@ if TYPE_CHECKING:
     from minidb.values import Value
 
 type ReadKey = tuple[str, tuple[tuple[str, Value | None], ...]]  # ("lookup" | "match", frozen key)
-type RangeRead = tuple[str, Value | None, Value | None, bool, bool]  # column, lo, hi, inclusive?
-
-
-def _in_range(value: Value | None, bounds: RangeRead) -> bool:
-    """Tell whether ``value`` lies within ``bounds``; NULL never does."""
-    _, lo, hi, lo_inclusive, hi_inclusive = bounds
-    if value is None:
-        return False
-    v = ordered(value)
-    if lo is not None and (v < ordered(lo) or (value == lo and not lo_inclusive)):
-        return False
-    return not (hi is not None and (v > ordered(hi) or (value == hi and not hi_inclusive)))
 
 
 class TransactionError(DatabaseError):
@@ -557,3 +545,17 @@ class UnitOfWork:
         except BaseException:
             self.rollback()
             raise
+
+
+type RangeRead = tuple[str, Value | None, Value | None, bool, bool]  # column, lo, hi, inclusive?
+
+
+def _in_range(value: Value | None, bounds: RangeRead) -> bool:
+    """Tell whether ``value`` lies within ``bounds``; NULL never does."""
+    _, lo, hi, lo_inclusive, hi_inclusive = bounds
+    if value is None:
+        return False
+    v = ordered(value)
+    if lo is not None and (v < ordered(lo) or (value == lo and not lo_inclusive)):
+        return False
+    return not (hi is not None and (v > ordered(hi) or (value == hi and not hi_inclusive)))

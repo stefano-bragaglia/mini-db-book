@@ -87,7 +87,3 @@ __all__ = [
     "lit",
     "normalizers",
 ]
-
-
-def main() -> None:
-    print("Hello from minidb!")

@@ -75,32 +75,3 @@ ORDERS: Relation = [
     {"order_id": 11, "user_id": 2, "total": 40},
     {"order_id": 12, "user_id": 1, "total": 15},
 ]
-
-
-def main() -> None:
-    older_than_40 = lambda user: "age" in user and user["age"] is not None and user["age"] > 40
-
-    users_older_than_40 = select(USERS, older_than_40)
-    print(users_older_than_40)
-
-    names_of_users_older_than_40 = project(users_older_than_40, "name")
-    print(names_of_users_older_than_40)
-
-    print(project(select(USERS, older_than_40), "name"))
-
-    same_id = lambda user, order: user["id"] == order["user_id"]
-
-    users_and_orders = join(USERS, ORDERS, same_id)
-    print(users_and_orders)
-
-    users_and_orders_total = project(users_and_orders, "name", "total")
-    print(users_and_orders_total)
-
-    print(project(join(USERS, ORDERS, same_id), "name", "total"))
-
-    print(project(join(select(USERS, older_than_40), ORDERS, same_id), "name", "total"))
-
-
-if __name__ == '__main__':
-    main()
-    print("Done.")

@@ -1,11 +1,8 @@
 """Declare tables: their columns, and the pipeline that prepares rows."""
 
-from collections.abc import Callable
-from collections.abc import Iterable
-from collections.abc import Mapping
-from copy import replace
 from dataclasses import dataclass
 from dataclasses import field
+from dataclasses import replace
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 from typing import Literal
@@ -16,15 +13,15 @@ from minidb.errors import NotNullError
 from minidb.errors import SchemaError
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from collections.abc import Iterable
+    from collections.abc import Mapping
+
     from minidb.types import Type
     from minidb.values import Row
     from minidb.values import Value
 
 type Normalizer = Callable[[Value], Value]
-type RowCheck = Callable[[Mapping[str, Value | None]], object]
-
-type OnDelete = Literal["restrict", "cascade", "set null"]
-ON_DELETE_ACTIONS: tuple[OnDelete, ...] = ("restrict", "cascade", "set null")
 
 
 @dataclass(frozen=True)
@@ -93,7 +90,6 @@ class Check:
     predicate: RowCheck
 
 
-# src/minidb/schema.py (replace TableSchema)
 @dataclass(frozen=True)
 class TableSchema:
     """Declare a table, its keys, and the constraint pipeline for its rows.
@@ -218,6 +214,13 @@ def as_key(columns: str | Iterable[str]) -> tuple[str, ...]:
     :return: the names as a tuple.
     """
     return (columns,) if isinstance(columns, str) else tuple(columns)
+
+
+type RowCheck = Callable[[Mapping[str, Value | None]], object]
+
+
+type OnDelete = Literal["restrict", "cascade", "set null"]
+ON_DELETE_ACTIONS: tuple[OnDelete, ...] = ("restrict", "cascade", "set null")
 
 
 @dataclass(frozen=True)

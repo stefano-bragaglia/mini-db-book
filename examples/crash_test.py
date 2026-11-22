@@ -1,4 +1,3 @@
-# examples/crash_test.py
 """Kill a process that is committing transfers, recover its database, and check the total.
 
 Every transfer is either entirely present or entirely absent, so the total

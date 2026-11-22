@@ -8,18 +8,14 @@ from typing import cast
 
 type Value = bool | int | float | str | Decimal | dt.date | dt.datetime
 type Row = dict[str, Value | None]
-type Primitive = bool | int | float | str | list[Primitive] | dict[str, Primitive] | None
 
 
 class Ordered(Protocol):
     """Describe values that can be ordered among themselves."""
 
     def __lt__(self, other: Self, /) -> bool: ...
-
     def __le__(self, other: Self, /) -> bool: ...
-
     def __gt__(self, other: Self, /) -> bool: ...
-
     def __ge__(self, other: Self, /) -> bool: ...
 
 
@@ -27,11 +23,8 @@ class Arithmetic(Protocol):
     """Describe values that support the four arithmetic operators among themselves."""
 
     def __add__(self, other: Self, /) -> Self: ...
-
     def __sub__(self, other: Self, /) -> Self: ...
-
     def __mul__(self, other: Self, /) -> Self: ...
-
     def __truediv__(self, other: Self, /) -> Self: ...
 
 
@@ -54,3 +47,6 @@ def arithmetic(value: Value) -> Arithmetic:
     :return: the same object.
     """
     return cast("Arithmetic", value)
+
+
+type Primitive = bool | int | float | str | list[Primitive] | dict[str, Primitive] | None

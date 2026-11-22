@@ -1,4 +1,3 @@
-# examples/transfers.py
 """Move money between accounts from many threads, and check none is lost.
 
 An auditor thread keeps summing all balances while the transfers run; it

@@ -1,4 +1,3 @@
-# examples/starvation.py
 """Measure how long a late reader and a late writer wait under each lock.
 
 A stream of overlapping readers and two looping writers keep each lock busy
@@ -83,4 +82,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    print("Done.")

@@ -28,7 +28,7 @@ from minidb.uow import UnitOfWork
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-    from collections.abc import Generator
+    from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
     from contextlib import AbstractContextManager
@@ -166,16 +166,20 @@ class Database:
         except KeyError:
             raise SchemaError(f"no such table: {name!r}") from None
 
-    def create_index(self, table: str, name: str, columns: Sequence[str], *, unique: bool = False, kind: str = "hash") -> None:
-        """Create an index on ``table``; see :meth:`Table.create_index`.
+    def create_index(
+        self, table: str, name: str, columns: Sequence[str], *, unique: bool = False, kind: str = "hash"
+    ) -> None:
+        """Create an index on ``table``, while no transaction commits.
 
         :param table: the table's name.
         :param name: the index's name.
         :param columns: the indexed columns, in key order.
         :param unique: whether to refuse duplicate keys; ``False`` by default.
-        :param kind: ``"hash"`` (default) or ``"sorted"``.
+        :param kind: the kind of index, ``"hash"`` by default; see
+            :data:`minidb.table.INDEX_KINDS`.
         """
-        self.table(table).create_index(name, columns, unique=unique, kind=kind)
+        with self.exclusive_lock():
+            self.table(table).create_index(name, columns, unique=unique, kind=kind)
 
     # -- reads ---------------------------------------------------------------------
     def get(self, table: str, rowid: int) -> Row | None:
@@ -361,7 +365,7 @@ class Database:
             self._lock.release_write()
 
     @contextmanager
-    def reading(self) -> Generator[Database]:
+    def reading(self) -> Iterator[Database]:
         """Hold the lock in shared mode for one read outside any unit of work.
 
         :return: a context manager that yields the database.

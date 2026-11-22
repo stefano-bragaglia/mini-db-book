@@ -59,17 +59,15 @@ class KeyedIndex:
     :param unique: whether two rows may share a key; ``False`` by default.
     """
 
-    def __init__(self, name: str, columns: Iterable[str], *, unique: bool) -> None:
-        self.name: str = name
-        self.columns: tuple[str, ...] = tuple(columns)
-        self.unique: bool = unique
+    def __init__(self, name: str, columns: Iterable[str], *, unique: bool = False) -> None:
+        self.name = name
+        self.columns = tuple(columns)
+        self.unique = unique
 
     def key_of(self, row: Mapping[str, Value | None]) -> Key | None:
         """Return the row's values in the indexed columns, or ``None`` if one is NULL.
 
-        >>> KeyedIndex("i", ["a", "b"], unique=False).key_of({"a": 1, "b": 2, "c": 3})
-        (1, 2)
-        >>> KeyedIndex("i", ["a", "b"], unique=False).key_of({"a": 1, "b": None, "c": 3}) is None
+        >>> KeyedIndex("i", ["a", "b"]).key_of({"a": 1, "b": None, "c": 3}) is None
         True
 
         :param row: a row with (at least) the indexed columns.
@@ -98,9 +96,6 @@ class HashIndex(KeyedIndex):
     def __init__(self, name: str, columns: Iterable[str], *, unique: bool = False) -> None:
         super().__init__(name, columns, unique=unique)
         self._entries: dict[Key, set[int]] = {}
-
-    def __repr__(self) -> str:
-        return f"<{'unique ' if self.unique else ''}{self.kind} index {self.name} on {self.columns}>"
 
     def add(self, rowid: int, row: Mapping[str, Value | None]) -> None:
         """Record that ``rowid`` holds ``row``.
@@ -136,6 +131,10 @@ class HashIndex(KeyedIndex):
     def distinct_keys(self) -> int:
         """Return the number of different keys in the index."""
         return len(self._entries)
+
+    def __repr__(self) -> str:
+        u = "unique " if self.unique else ""
+        return f"<{u}{self.kind} index {self.name} on {self.columns}>"
 
 
 @runtime_checkable

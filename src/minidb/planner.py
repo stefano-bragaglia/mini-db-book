@@ -1,4 +1,3 @@
-# src/minidb/planner.py
 """Plan queries: choose access paths, push filters down, and order joins by cost.
 
 The planner turns a :class:`~minidb.query.Query` into a tree of physical

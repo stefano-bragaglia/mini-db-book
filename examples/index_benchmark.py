@@ -1,4 +1,3 @@
-# examples/index_benchmark.py
 """Insert 200,000 random keys into each kind of index, then run 1,000 range scans."""
 
 import random

@@ -1,4 +1,3 @@
-# examples/planner_speed.py
 """Time the same join with Chapter 7's naive plan and with the planner's plan."""
 
 import time

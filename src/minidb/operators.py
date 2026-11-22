@@ -12,8 +12,6 @@ from typing import Protocol
 from typing import cast
 from typing import override
 
-from minidb.schema import TableSchema
-from minidb.values import Ordered
 from minidb.values import arithmetic
 from minidb.values import ordered
 
@@ -24,13 +22,9 @@ if TYPE_CHECKING:
 
     from minidb.schema import TableSchema
     from minidb.table import Table
+    from minidb.values import Ordered
     from minidb.values import Row as StoredRow
     from minidb.values import Value
-
-type RowPredicate = Callable[[Row], object]
-type RowFunction = Callable[[Row], Value | None]
-type SortKey = tuple[str | RowFunction, bool]
-type JoinKind = Literal["inner", "left"]
 
 
 class Row(dict[str, "Value | None"]):
@@ -69,6 +63,11 @@ class Source(Protocol):
         ...
 
 
+type RowPredicate = Callable[[Row], object]
+type RowFunction = Callable[[Row], Value | None]
+type SortKey = tuple[str | RowFunction, bool]
+
+
 class Operator:
     """Produce rows when iterated; the base class of every operator.
 
@@ -104,6 +103,7 @@ class Operator:
         if self.estimate is not None:
             line += f"  [~{self.estimate:,.0f} rows]"
         return "\n".join([line] + [child.explain(indent + 1) for child in self.children])
+
 
 class Scan(Operator):
     """Yield every row of a source, with names qualified by ``alias``.
@@ -310,6 +310,9 @@ class Distinct(Operator):
             if key not in seen:
                 seen.add(key)
                 yield row
+
+
+type JoinKind = Literal["inner", "left"]
 
 
 class Accumulator(Protocol):

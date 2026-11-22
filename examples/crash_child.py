@@ -1,4 +1,3 @@
-# examples/crash_child.py
 """Make money transfers against a database on disk as fast as possible, forever.
 
 ``examples.crash_test`` starts this program and kills it at a random moment.
