@@ -8,8 +8,8 @@ reads.
 import threading
 from types import MappingProxyType
 from typing import TYPE_CHECKING
-from typing import Sequence
 
+from minidb.btree import BTreeIndex
 from minidb.errors import SchemaError
 from minidb.errors import UniqueError
 from minidb.index import HashIndex
@@ -31,7 +31,7 @@ if TYPE_CHECKING:
 type Predicate = Callable[[Mapping[str, Value | None]], object]
 type Where = Predicate | Mapping[str, object] | None
 
-INDEX_KINDS: dict[str, IndexFactory] = {"hash": HashIndex, "sorted": SortedIndex}
+INDEX_KINDS: dict[str, IndexFactory] = {"hash": HashIndex, "sorted": SortedIndex, "btree": BTreeIndex}
 
 
 class Table:
@@ -80,9 +80,7 @@ class Table:
             self._next_rowid = max(self._next_rowid, rowid + 1)
 
     # -- indexes ------------------------------------------------------------------
-    def create_index(
-        self, name: str, columns: Iterable[str], *, unique: bool = False, kind: str = "hash"
-    ) -> Index:
+    def create_index(self, name: str, columns: Iterable[str], *, unique: bool = False, kind: str = "hash") -> Index:
         """Create an index over the existing rows, and maintain it from now on.
 
         :param name: the index's name.
