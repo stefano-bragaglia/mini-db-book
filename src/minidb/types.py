@@ -5,14 +5,18 @@ import datetime as dt
 import math
 import re
 from dataclasses import dataclass
+from decimal import ROUND_HALF_EVEN
 from decimal import Decimal
 from decimal import InvalidOperation
-from decimal import ROUND_HALF_EVEN
+from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import override
 
 from minidb.errors import DomainError
 from minidb.values import Value
+
+if TYPE_CHECKING:
+    from minidb.values import Primitive
 
 _INT_RE = re.compile(r"[+-]?\d+")
 _TRUE = frozenset({"true", "t", "yes", "y", "on", "1"})
@@ -32,6 +36,25 @@ class Type[T: Value]:
     """
 
     exact_types: ClassVar[tuple[type, ...]] = ()
+
+    def to_primitive(self, value: Value | None) -> Primitive:
+        """Convert a canonical value into something any :class:`Format` can store.
+
+        :param value: a value of this type, or ``None``.
+        :return: the value itself, in the base class.
+        """
+        return value if not isinstance(value, Decimal | dt.date) else str(value)
+
+    def from_primitive(self, value: Primitive) -> T | None:
+        """Convert a stored primitive back into a canonical value, and validate it.
+
+        :param value: what :meth:`to_primitive` produced.
+        :return: the canonical value, or ``None``.
+        :raises DomainError: if the stored value is not valid for this type.
+        """
+        result = self.normalize(value)
+        self.validate(result)
+        return result
 
     def normalize(self, value: object) -> T | None:
         """Convert ``value`` to this type's canonical form.
@@ -297,6 +320,11 @@ class Timestamp(Type[dt.datetime]):
 
     with_timezone: bool = True
     exact_types: ClassVar[tuple[type, ...]] = (dt.datetime,)
+
+    # src/minidb/types.py (add to Timestamp)
+    @override
+    def to_primitive(self, value: Value | None) -> Primitive:
+        return value.isoformat() if isinstance(value, dt.datetime) else None
 
     @override
     def coerce(self, value: object) -> dt.datetime:

@@ -19,6 +19,9 @@ from minidb.locks import FairRWLock
 from minidb.query import Query
 from minidb.schema import TableSchema
 from minidb.schema import as_key
+from minidb.storage import decode_row
+from minidb.storage import encode_row
+from minidb.storage import schema_fingerprint
 from minidb.table import Table
 from minidb.uow import TransactionError
 from minidb.uow import UnitOfWork
@@ -35,20 +38,25 @@ if TYPE_CHECKING:
     from minidb.schema import Check
     from minidb.schema import Column
     from minidb.schema import ForeignKey
+    from minidb.storage import LogRecord
+    from minidb.storage import Snapshot
+    from minidb.storage import Storage
+    from minidb.storage import TableData
     from minidb.table import Where
+    from minidb.values import Primitive
     from minidb.values import Row
 
 
 class Database:
     """Hold tables and the foreign keys between them, and run CRUD on them."""
 
-    # src/minidb/database.py (replace Database.__init__)
     def __init__(self, *, lock: RWLock | None = None) -> None:
         self.tables: dict[str, Table] = {}
         self.foreign_keys: list[ForeignKey] = []
-        self.commit_seq = 0  # the number of the last commit
+        self.commit_seq = 0
+        self.storage: Storage | None = None
         self._lock: RWLock = lock if lock is not None else FairRWLock()
-        self._local = threading.local()  # .uow: this thread's active unit of work
+        self._local = threading.local()
 
     def shared_lock(self) -> AbstractContextManager[None]:
         """Return a context manager that holds the database lock in shared mode.
@@ -231,25 +239,35 @@ class Database:
         return self.transaction(lambda uow: uow.delete(table, where))
 
     def apply(self, changes: Sequence[Change]) -> None:
-        """Write validated changes as one commit, stamping every row with its version.
+        """Write validated changes as one commit: log first, then memory.
 
         The caller holds the exclusive lock.
 
         :param changes: the changes to write.
         """
-        self.commit_seq += 1
-        seq = self.commit_seq
+        seq = self.commit_seq + 1
+        if self.storage is not None:  # the write-ahead rule
+            self.storage.append({"seq": seq, "changes": [self._encode(c) for c in changes]})
+        self.commit_seq = seq
         for c in changes:
-            t = self.tables[c.table]
-            if c.after is None:
-                t.remove(c.rowid)
-                t.row_versions.pop(c.rowid, None)
-            else:
-                t.put(c.rowid, c.after)
-                t.row_versions[c.rowid] = seq
-            t.version = seq
+            self._apply_one(c.table, c.rowid, c.after, seq)
 
-    # src/minidb/database.py (replace Database.unit_of_work)
+    def _encode(self, c: Change) -> tuple[str, int, list[Primitive] | None]:
+        values = None if c.after is None else encode_row(self.tables[c.table].schema, c.after)
+        return (c.table, c.rowid, values)
+
+    def _apply_one(self, table: str, rowid: int, row: Row | None, seq: int) -> None:
+        t = self.tables[table]
+        if row is None:
+            if rowid in t.rows:
+                t.remove(rowid)
+            t.row_versions.pop(rowid, None)
+        else:
+            t.put(rowid, row)
+            t.row_versions[rowid] = seq
+            t.reserve_rowid(rowid)
+        t.version = seq
+
     def unit_of_work(self, *, deferred: bool = False, readonly: bool = False, exclusive: bool = False) -> UnitOfWork:
         """Start a transaction; see :class:`UnitOfWork`.
 
@@ -352,3 +370,76 @@ class Database:
             raise TransactionError("inside a unit of work, read through the unit of work")
         with self._lock.read():
             yield self
+
+    # -- persistence ---------------------------------------------------------------------
+    def attach(self, storage: Storage) -> None:
+        """Load the saved data, and log every future commit to ``storage``.
+
+        Declare the tables first, then attach.
+
+        :param storage: where the data lives.
+        :raises SchemaError: if storage is already attached, data was
+            inserted before attaching, or the stored data was written with a
+            different schema.
+        """
+        with self.exclusive_lock():
+            self._check_attachable()
+            state = storage.read_snapshot()
+            if state is not None:
+                self._load_state(state)
+            for record in storage.read_log():
+                if record["seq"] > self.commit_seq:  # else it is in the snapshot already
+                    self._replay(record)
+            self.storage = storage
+
+    def _check_attachable(self) -> None:
+        if self.storage is not None:
+            raise SchemaError("storage already attached")
+        if any(len(t) for t in self.tables.values()):
+            raise SchemaError("attach storage before inserting data")
+
+    def _replay(self, record: LogRecord) -> None:
+        for table, rowid, values in record["changes"]:
+            row = None if values is None else decode_row(self.tables[table].schema, values)
+            self._apply_one(table, rowid, row, record["seq"])
+        self.commit_seq = record["seq"]
+
+    def checkpoint(self) -> None:
+        """Write a snapshot and empty the log. Writers wait; readers don't.
+
+        :raises SchemaError: if no storage is attached.
+        """
+        if self.storage is None:
+            raise SchemaError("no storage attached")
+        with self.shared_lock():
+            tables: dict[str, TableData] = {
+                name: {
+                    "next_rowid": t.next_rowid,
+                    "rows": [(rid, encode_row(t.schema, row)) for rid, row in t.rows.items()],
+                }
+                for name, t in self.tables.items()
+            }
+            self.storage.write_snapshot(
+                {"format": 1, "fingerprint": self._fingerprint(), "commit_seq": self.commit_seq, "tables": tables}
+            )
+            self.storage.truncate_log()
+
+    def _fingerprint(self) -> str:
+        return schema_fingerprint(self.tables, self.foreign_keys)
+
+    def _load_state(self, state: Snapshot) -> None:
+        if state["fingerprint"] != self._fingerprint():
+            raise SchemaError("stored data was written with a different schema")
+        self.commit_seq = state["commit_seq"]
+        for name, data in state["tables"].items():
+            t = self.tables[name]
+            for rowid, values in data["rows"]:
+                t.put(rowid, decode_row(t.schema, values))
+                t.row_versions[rowid] = self.commit_seq
+            t.reserve_rowid(data["next_rowid"] - 1)
+            t.version = self.commit_seq
+
+    def close(self) -> None:
+        """Close the attached storage's files, if any."""
+        if self.storage is not None:
+            self.storage.close()

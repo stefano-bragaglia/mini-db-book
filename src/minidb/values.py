@@ -1,12 +1,14 @@
 """Name the types of the values that tables hold."""
+
 import datetime as dt
 from decimal import Decimal
-from typing import cast
 from typing import Protocol
 from typing import Self
+from typing import cast
 
 type Value = bool | int | float | str | Decimal | dt.date | dt.datetime
 type Row = dict[str, Value | None]
+type Primitive = bool | int | float | str | list[Primitive] | dict[str, Primitive] | None
 
 
 class Ordered(Protocol):

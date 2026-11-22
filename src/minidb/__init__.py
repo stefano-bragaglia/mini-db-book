@@ -23,6 +23,9 @@ from minidb.schema import Check
 from minidb.schema import Column
 from minidb.schema import ForeignKey
 from minidb.schema import TableSchema
+from minidb.storage import Format
+from minidb.storage import JsonFormat
+from minidb.storage import Storage
 from minidb.types import Boolean
 from minidb.types import Date
 from minidb.types import Integer
@@ -34,7 +37,6 @@ from minidb.uow import Record
 from minidb.uow import TransactionError
 from minidb.uow import UnitOfWork
 
-# src/minidb/__init__.py (replace __all__)
 __all__ = [
     "Avg",
     "Boolean",
@@ -52,7 +54,9 @@ __all__ = [
     "FairRWLock",
     "ForeignKey",
     "ForeignKeyError",
+    "Format",
     "Integer",
+    "JsonFormat",
     "Max",
     "Min",
     "NotNullError",
@@ -61,6 +65,7 @@ __all__ = [
     "Real",
     "Record",
     "SchemaError",
+    "Storage",
     "Sum",
     "TableSchema",
     "Text",

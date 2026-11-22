@@ -59,6 +59,19 @@ class Table:
     def __len__(self) -> int:
         return len(self.rows)
 
+    @property
+    def next_rowid(self) -> int:
+        """Return the rowid the next insert will get."""
+        return self._next_rowid
+
+    def reserve_rowid(self, rowid: int) -> None:
+        """Make sure the counter never hands out ``rowid``, or anything below it.
+
+        :param rowid: a rowid that is in use.
+        """
+        with self._rowid_latch:
+            self._next_rowid = max(self._next_rowid, rowid + 1)
+
     # -- indexes ------------------------------------------------------------------
     def create_index(self, name: str, columns: Iterable[str], *, unique: bool = False) -> Index:
         """Create an index over the existing rows, and maintain it from now on.

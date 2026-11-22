@@ -22,7 +22,7 @@ The book is complete; the code in this repository follows it chapter by chapter 
 |       7 | Query primitives               |  ✅  |
 |    8–9 | Unit of Work (transactions)    |  ✅  |
 |  10–12 | Concurrency and isolation      |  ✅  |
-|      13 | Persistence                    |  ⬜  |
+|      13 | Persistence                    |  ✅  |
 |      14 | Query planning                 |  ⬜  |
 |      15 | B-trees                        |  ⬜  |
 |       A | SQL front end                  |  ⬜  |
