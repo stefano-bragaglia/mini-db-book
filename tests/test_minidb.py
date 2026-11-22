@@ -47,17 +47,6 @@ def expect(error: type[BaseException], context: str = "") -> Iterator[None]:
 
 
 # -- an integrity checker: the invariants every test can assert ------------------------------
-def check_integrity(db: Database) -> None:
-    """Raise AssertionError if any index, key or reference is inconsistent."""
-    for t in db.tables.values():
-        for index in t.indexes.values():
-            _check_index(t, index)
-        for row in t.rows.values():
-            t.schema.prepare_row({}, base=row)  # re-runs NOT NULL and CHECKs
-    for fk in db.foreign_keys:
-        _check_references(db, fk)
-
-
 def _check_index(t: Table, index: Index) -> None:
     """Rebuild the index's expected contents from the rows, and compare."""
     expected: dict[tuple[object, ...], set[int]] = {}
@@ -76,6 +65,17 @@ def _check_references(db: Database, fk: ForeignKey) -> None:
     for row in db.tables[fk.table].rows.values():
         key = fk.parent_key(row)
         assert key is None or parent.lookup(key), f"{fk.name}: orphan {row}"
+
+
+def check_integrity(db: Database) -> None:
+    """Raise AssertionError if any index, key or reference is inconsistent."""
+    for t in db.tables.values():
+        for index in t.indexes.values():
+            _check_index(t, index)
+        for row in t.rows.values():
+            t.schema.prepare_row({}, base=row)  # re-runs NOT NULL and CHECKs
+    for fk in db.foreign_keys:
+        _check_references(db, fk)
 
 
 # -- unit tests -----------------------------------------------------------------------------
@@ -126,34 +126,13 @@ class BTreeProperties(unittest.TestCase):
 
 
 # -- model-based: random operations on minidb and on a dict, compared after each step ----------
-class UsersModel:
-    """Predict, with a plain dict, what minidb should do with a ``users`` table."""
-
-    def __init__(self) -> None:
-        self.rows: dict[int, Row] = {}
-
-    def insert(self, row: Row) -> type[Exception] | None:
-        if int(row["age"] or 0) < 0:
-            return CheckError
-        if row["id"] in self.rows or any(r["email"] == row["email"] for r in self.rows.values()):
-            return UniqueError
-        self.rows[int(row["id"] or 0)] = row
-        return None
-
-    def update(self, row: Row) -> type[Exception] | None:
-        uid = int(row["id"] or 0)
-        if uid not in self.rows:
-            return None
-        if int(row["age"] or 0) < 0:
-            return CheckError
-        if any(r["email"] == row["email"] and i != uid for i, r in self.rows.items()):
-            return UniqueError
-        self.rows[uid] = self.rows[uid] | row
-        return None
-
-    def delete(self, row: Row) -> type[Exception] | None:
-        self.rows.pop(int(row["id"] or 0), None)
-        return None
+def _actions(db: Database, row: Row) -> dict[str, Callable[[], object]]:
+    changes = {"email": row["email"], "age": row["age"]}
+    return {
+        "insert": lambda: db.insert("users", row),
+        "update": lambda: db.update("users", changes, {"id": row["id"]}),
+        "delete": lambda: db.delete("users", {"id": row["id"]}),
+    }
 
 
 def _users_db() -> Database:
@@ -166,15 +145,6 @@ def _users_db() -> Database:
     )
     db.create_index("users", "by_age", ["age"], kind="btree")
     return db
-
-
-def _actions(db: Database, row: Row) -> dict[str, Callable[[], object]]:
-    changes = {"email": row["email"], "age": row["age"]}
-    return {
-        "insert": lambda: db.insert("users", row),
-        "update": lambda: db.update("users", changes, {"id": row["id"]}),
-        "delete": lambda: db.delete("users", {"id": row["id"]}),
-    }
 
 
 class ModelBasedTest(unittest.TestCase):
@@ -199,19 +169,42 @@ class ModelBasedTest(unittest.TestCase):
         check_integrity(db)
 
 
+class UsersModel:
+    """Predict, with a plain dict, what minidb should do with a ``users`` table."""
+
+    def __init__(self) -> None:
+        self.rows: dict[int, Row] = {}
+
+    def delete(self, row: Row) -> type[Exception] | None:
+        self.rows.pop(int(row["id"] or 0), None)
+        return None
+
+    def insert(self, row: Row) -> type[Exception] | None:
+        if int(row["age"] or 0) < 0:
+            return CheckError
+        if row["id"] in self.rows or any(r["email"] == row["email"] for r in self.rows.values()):
+            return UniqueError
+        self.rows[int(row["id"] or 0)] = row
+        return None
+
+    def update(self, row: Row) -> type[Exception] | None:
+        uid = int(row["id"] or 0)
+        if uid not in self.rows:
+            return None
+        if int(row["age"] or 0) < 0:
+            return CheckError
+        if any(r["email"] == row["email"] and i != uid for i, r in self.rows.items()):
+            return UniqueError
+        self.rows[uid] = self.rows[uid] | row
+        return None
+
+
 # -- concurrency: invariants, fairness ----------------------------------------------------------
 def _move(uow: UnitOfWork, a: int, b: int) -> None:
     src, dst = uow.find("acct", {"id": a})[0], uow.find("acct", {"id": b})[0]
     if int(src["bal"] or 0) >= 10:
         src["bal"] = int(src["bal"] or 0) - 10
         dst["bal"] = int(dst["bal"] or 0) + 10
-
-
-def _transfers(db: Database, seed: int) -> None:
-    rnd = random.Random(seed)  # noqa: S311 - test data
-    for _ in range(100):
-        a, b = rnd.sample(range(5), 2)
-        db.transaction(lambda uow, a=a, b=b: _move(uow, a, b))
 
 
 def _reader(lock: FairRWLock, stop: threading.Event, offset: float) -> None:
@@ -221,20 +214,14 @@ def _reader(lock: FairRWLock, stop: threading.Event, offset: float) -> None:
             time.sleep(0.005)
 
 
-class ConcurrencyTests(unittest.TestCase):
-    def test_transfers_preserve_total(self) -> None:
-        db = Database()
-        db.create_table("acct", [Column("id", Integer()), Column("bal", Integer(min=0))], primary_key="id")
-        for i in range(5):
-            db.insert("acct", {"id": i, "bal": 100})
-        threads = [threading.Thread(target=_transfers, args=(db, s)) for s in range(6)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        assert sum(int(r["bal"] or 0) for r in db.select("acct")) == 500
-        check_integrity(db)
+def _transfers(db: Database, seed: int) -> None:
+    rnd = random.Random(seed)  # noqa: S311 - test data
+    for _ in range(100):
+        a, b = rnd.sample(range(5), 2)
+        db.transaction(lambda uow, a=a, b=b: _move(uow, a, b))
 
+
+class ConcurrencyTests(unittest.TestCase):
     def test_fair_lock_bounds_writer_wait(self) -> None:
         lock, stop = FairRWLock(), threading.Event()
         readers = [threading.Thread(target=_reader, args=(lock, stop, i * 0.002)) for i in range(4)]
@@ -249,17 +236,30 @@ class ConcurrencyTests(unittest.TestCase):
             r.join()
         assert waited < 0.1  # a reader-preferring lock would wait until stop
 
+    def test_transfers_preserve_total(self) -> None:
+        db = Database()
+        db.create_table("acct", [Column("id", Integer()), Column("bal", Integer(min=0))], primary_key="id")
+        for i in range(5):
+            db.insert("acct", {"id": i, "bal": 100})
+        threads = [threading.Thread(target=_transfers, args=(db, s)) for s in range(6)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        assert sum(int(r["bal"] or 0) for r in db.select("acct")) == 500
+        check_integrity(db)
+
 
 # -- crash recovery: every possible torn write recovers to a prefix of the commits --------------
+def _ids(db: Database) -> list[int]:
+    return sorted(int(r["id"] or 0) for r in db.select("t"))
+
+
 def _open(path: str) -> Database:
     db = Database()
     db.create_table("t", [Column("id", Integer()), Column("v", Text())], primary_key="id")
     db.attach(Storage(path, sync=False))
     return db
-
-
-def _ids(db: Database) -> list[int]:
-    return sorted(int(r["id"] or 0) for r in db.select("t"))
 
 
 def _write_history(folder: str) -> list[list[int]]:

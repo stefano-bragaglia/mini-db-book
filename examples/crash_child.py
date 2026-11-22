@@ -15,18 +15,6 @@ from minidb import UnitOfWork
 ACCOUNTS, START = 10, 1000
 
 
-def open_db(folder: str) -> Database:
-    """Declare the schema and attach the storage in ``folder``.
-
-    :param folder: the database directory.
-    :return: the database, with its saved data loaded.
-    """
-    db = Database()
-    db.create_table("acct", [Column("id", Integer()), Column("bal", Integer(min=0))], primary_key="id")
-    db.attach(Storage(folder))
-    return db
-
-
 def move(uow: UnitOfWork, a: int, b: int, amount: int) -> None:
     """Move ``amount`` from account ``a`` to account ``b``, if ``a`` has enough.
 
@@ -39,6 +27,18 @@ def move(uow: UnitOfWork, a: int, b: int, amount: int) -> None:
     if int(src["bal"] or 0) >= amount:
         src["bal"] = int(src["bal"] or 0) - amount
         dst["bal"] = int(dst["bal"] or 0) + amount
+
+
+def open_db(folder: str) -> Database:
+    """Declare the schema and attach the storage in ``folder``.
+
+    :param folder: the database directory.
+    :return: the database, with its saved data loaded.
+    """
+    db = Database()
+    db.create_table("acct", [Column("id", Integer()), Column("bal", Integer(min=0))], primary_key="id")
+    db.attach(Storage(folder))
+    return db
 
 
 def main() -> None:

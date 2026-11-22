@@ -41,6 +41,82 @@ class Format(Protocol):
         ...
 
 
+class LogRecord(TypedDict):
+    """Describe one commit in the write-ahead log."""
+
+    seq: int
+    changes: list[tuple[str, int, list[Primitive] | None]]  # (table, rowid, values or None)
+
+
+class Snapshot(TypedDict):
+    """Describe a snapshot: the whole database at one commit."""
+
+    format: int
+    fingerprint: str
+    commit_seq: int
+    tables: dict[str, TableData]
+
+
+class TableData(TypedDict):
+    """Describe one table in a snapshot."""
+
+    next_rowid: int
+    rows: list[tuple[int, list[Primitive]]]
+
+
+_FRAME = struct.Struct(">II")  # payload length, crc32
+
+
+def _frame_at(data: bytes, pos: int) -> bytes | None:
+    """Return the payload of the intact frame at ``pos``, or ``None`` if there isn't one."""
+    if pos + _FRAME.size > len(data):
+        return None
+    length, crc = _FRAME.unpack_from(data, pos)
+    payload = data[pos + _FRAME.size : pos + _FRAME.size + length]
+    if len(payload) < length or zlib.crc32(payload) != crc:
+        return None  # torn write
+    return payload
+
+
+def decode_row(schema: TableSchema, values: Sequence[Primitive]) -> Row:
+    """Decode what :func:`encode_row` produced, validating every value.
+
+    :param schema: the row's table.
+    :param values: one primitive per column.
+    :return: the row.
+    :raises ValueError: if the number of values is wrong.
+    :raises DomainError: if a value is not valid for its column.
+    """
+    if len(values) != len(schema.columns):
+        raise ValueError(f"{schema.name}: stored row has {len(values)} values")
+    return {c.name: c.type.from_primitive(v) for c, v in zip(schema.columns, values, strict=True)}
+
+
+def encode_row(schema: TableSchema, row: Row) -> list[Primitive]:
+    """Encode a row as a list of primitives, in column order.
+
+    :param schema: the row's table.
+    :param row: the row.
+    :return: one primitive per column.
+    """
+    return [c.type.to_primitive(row[c.name]) for c in schema.columns]
+
+
+def schema_fingerprint(tables: Mapping[str, Table], foreign_keys: Sequence[ForeignKey]) -> str:
+    """Hash everything declarative about a schema; checks and defaults are code, and left out.
+
+    :param tables: the tables, by name.
+    :param foreign_keys: the foreign keys between them.
+    :return: a short hexadecimal digest.
+    """
+    parts: list[object] = []
+    for name in sorted(tables):
+        s = tables[name].schema
+        parts.append((name, [(c.name, repr(c.type), c.nullable) for c in s.columns], s.primary_key, sorted(s.unique)))
+    parts.append(sorted((fk.table, fk.columns, fk.ref_table, fk.ref_columns, fk.on_delete) for fk in foreign_keys))
+    return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
+
+
 class JsonFormat:
     """Store primitives as compact UTF-8 JSON.
 
@@ -71,71 +147,6 @@ class JsonFormat:
         return result
 
 
-def encode_row(schema: TableSchema, row: Row) -> list[Primitive]:
-    """Encode a row as a list of primitives, in column order.
-
-    :param schema: the row's table.
-    :param row: the row.
-    :return: one primitive per column.
-    """
-    return [c.type.to_primitive(row[c.name]) for c in schema.columns]
-
-
-def decode_row(schema: TableSchema, values: Sequence[Primitive]) -> Row:
-    """Decode what :func:`encode_row` produced, validating every value.
-
-    :param schema: the row's table.
-    :param values: one primitive per column.
-    :return: the row.
-    :raises ValueError: if the number of values is wrong.
-    :raises DomainError: if a value is not valid for its column.
-    """
-    if len(values) != len(schema.columns):
-        raise ValueError(f"{schema.name}: stored row has {len(values)} values")
-    return {c.name: c.type.from_primitive(v) for c, v in zip(schema.columns, values, strict=True)}
-
-
-def schema_fingerprint(tables: Mapping[str, Table], foreign_keys: Sequence[ForeignKey]) -> str:
-    """Hash everything declarative about a schema; checks and defaults are code, and left out.
-
-    :param tables: the tables, by name.
-    :param foreign_keys: the foreign keys between them.
-    :return: a short hexadecimal digest.
-    """
-    parts: list[object] = []
-    for name in sorted(tables):
-        s = tables[name].schema
-        parts.append((name, [(c.name, repr(c.type), c.nullable) for c in s.columns], s.primary_key, sorted(s.unique)))
-    parts.append(sorted((fk.table, fk.columns, fk.ref_table, fk.ref_columns, fk.on_delete) for fk in foreign_keys))
-    return hashlib.sha256(repr(parts).encode()).hexdigest()[:16]
-
-
-class TableData(TypedDict):
-    """Describe one table in a snapshot."""
-
-    next_rowid: int
-    rows: list[tuple[int, list[Primitive]]]
-
-
-class Snapshot(TypedDict):
-    """Describe a snapshot: the whole database at one commit."""
-
-    format: int
-    fingerprint: str
-    commit_seq: int
-    tables: dict[str, TableData]
-
-
-class LogRecord(TypedDict):
-    """Describe one commit in the write-ahead log."""
-
-    seq: int
-    changes: list[tuple[str, int, list[Primitive] | None]]  # (table, rowid, values or None)
-
-
-_FRAME = struct.Struct(">II")  # payload length, crc32
-
-
 class Storage:
     """Keep a database in a directory: ``snapshot<suffix>`` plus ``wal.log``.
 
@@ -157,6 +168,16 @@ class Storage:
         self._log: BufferedWriter | None = None
 
     # -- snapshot ----------------------------------------------------------------------
+
+    def read_snapshot(self) -> Snapshot | None:
+        """Return the last snapshot, or ``None`` if there is none yet.
+
+        :return: the snapshot, or ``None``.
+        """
+        if not self.snapshot_path.exists():
+            return None
+        return cast("Snapshot", self.format.loads(self.snapshot_path.read_bytes()))
+
     def write_snapshot(self, state: Snapshot) -> None:
         """Replace the snapshot atomically: write a temporary file, then rename it.
 
@@ -170,16 +191,8 @@ class Storage:
             tmp.replace(self.snapshot_path)  # atomic switch
             self._fsync_dir()
 
-    def read_snapshot(self) -> Snapshot | None:
-        """Return the last snapshot, or ``None`` if there is none yet.
-
-        :return: the snapshot, or ``None``.
-        """
-        if not self.snapshot_path.exists():
-            return None
-        return cast("Snapshot", self.format.loads(self.snapshot_path.read_bytes()))
-
     # -- log ------------------------------------------------------------------------------
+
     def append(self, record: LogRecord) -> None:
         """Append one framed record to the log, and make it durable.
 
@@ -192,6 +205,13 @@ class Storage:
                 self._log = self.log_path.open("ab")
             self._log.write(frame)
             self._fsync(self._log)
+
+    def close(self) -> None:
+        """Close the log file, if it is open."""
+        with self._latch:
+            if self._log is not None:
+                self._log.close()
+                self._log = None
 
     def read_log(self) -> Iterator[LogRecord]:
         """Yield the intact records, then cut off any torn or corrupt tail.
@@ -219,14 +239,8 @@ class Storage:
             with self.log_path.open("wb") as f:
                 self._fsync(f)
 
-    def close(self) -> None:
-        """Close the log file, if it is open."""
-        with self._latch:
-            if self._log is not None:
-                self._log.close()
-                self._log = None
-
     # -- fsync helpers --------------------------------------------------------------------
+
     def _fsync(self, f: BufferedWriter | BufferedRandom) -> None:
         f.flush()
         if self.sync:
@@ -240,14 +254,3 @@ class Storage:
             os.fsync(fd)
         finally:
             os.close(fd)
-
-
-def _frame_at(data: bytes, pos: int) -> bytes | None:
-    """Return the payload of the intact frame at ``pos``, or ``None`` if there isn't one."""
-    if pos + _FRAME.size > len(data):
-        return None
-    length, crc = _FRAME.unpack_from(data, pos)
-    payload = data[pos + _FRAME.size : pos + _FRAME.size + length]
-    if len(payload) < length or zlib.crc32(payload) != crc:
-        return None  # torn write
-    return payload

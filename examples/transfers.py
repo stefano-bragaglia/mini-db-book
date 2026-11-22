@@ -17,6 +17,19 @@ from minidb import Sum
 ACCOUNTS, START = 10, 1000
 
 
+def audit(db: Database, stop: threading.Event, problems: list[object]) -> None:
+    """Sum the balances until ``stop`` is set, recording any wrong total.
+
+    :param db: the database.
+    :param stop: set when the transfers have finished.
+    :param problems: where to record wrong totals.
+    """
+    while not stop.is_set():
+        result = db.query("accounts").group_by(total=Sum("balance")).first()
+        if result is None or result["total"] != ACCOUNTS * START:
+            problems.append(result)
+
+
 def gil_enabled() -> bool:
     """Return whether this interpreter runs with the GIL."""
     check = getattr(sys, "_is_gil_enabled", None)
@@ -40,19 +53,6 @@ def transfer(db: Database, seed: int) -> None:
                 dst["balance"] = int(dst["balance"] or 0) + amount
         except DomainError:
             pass
-
-
-def audit(db: Database, stop: threading.Event, problems: list[object]) -> None:
-    """Sum the balances until ``stop`` is set, recording any wrong total.
-
-    :param db: the database.
-    :param stop: set when the transfers have finished.
-    :param problems: where to record wrong totals.
-    """
-    while not stop.is_set():
-        result = db.query("accounts").group_by(total=Sum("balance")).first()
-        if result is None or result["total"] != ACCOUNTS * START:
-            problems.append(result)
 
 
 def main() -> None:

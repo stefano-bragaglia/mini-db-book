@@ -35,12 +35,12 @@ if TYPE_CHECKING:
 class QueryState(Protocol):
     """Describe where a query finds its tables, and how it protects its reads."""
 
-    def table(self, name: str) -> PlannedSource:
-        """Return the table (or view) called ``name``."""
-        ...
-
     def reading(self) -> AbstractContextManager[object]:
         """Return a context manager to hold while the query reads."""
+        ...
+
+    def table(self, name: str) -> PlannedSource:
+        """Return the table (or view) called ``name``."""
         ...
 
 
@@ -72,24 +72,13 @@ class Query:
     bounds: tuple[int | None, int] | None = None
 
     # -- building ---------------------------------------------------------------
-    def join(self, table: str, on: RowPredicate, alias: str | None = None, kind: JoinKind = "inner") -> Query:
-        """Join another table.
 
-        :param table: the table to join.
-        :param on: the join condition.
-        :param alias: its alias; ``None`` (the default) uses its name.
-        :param kind: ``"inner"`` (the default) or ``"left"``.
+    def distinct(self) -> Query:
+        """Drop duplicate result rows.
+
         :return: the extended query.
         """
-        return replace(self, joins=(*self.joins, (table, alias, on, kind)))
-
-    def where(self, predicate: RowPredicate) -> Query:
-        """Keep only rows for which ``predicate`` is true; calls combine with AND.
-
-        :param predicate: a function of the row.
-        :return: the extended query.
-        """
-        return replace(self, filters=(*self.filters, predicate))
+        return replace(self, is_distinct=True)
 
     def group_by(self, *columns: str, **aggregates: AggregateFunction[Accumulator]) -> Query:
         """Group rows by ``columns`` and compute ``aggregates`` for each group.
@@ -107,6 +96,26 @@ class Query:
         :return: the extended query.
         """
         return replace(self, having_filters=(*self.having_filters, predicate))
+
+    def join(self, table: str, on: RowPredicate, alias: str | None = None, kind: JoinKind = "inner") -> Query:
+        """Join another table.
+
+        :param table: the table to join.
+        :param on: the join condition.
+        :param alias: its alias; ``None`` (the default) uses its name.
+        :param kind: ``"inner"`` (the default) or ``"left"``.
+        :return: the extended query.
+        """
+        return replace(self, joins=(*self.joins, (table, alias, on, kind)))
+
+    def limit(self, count: int | None, offset: int = 0) -> Query:
+        """Return at most ``count`` rows, after skipping ``offset``.
+
+        :param count: the maximum number of rows, or ``None`` for no limit.
+        :param offset: the rows to skip first; 0 by default.
+        :return: the extended query.
+        """
+        return replace(self, bounds=(count, offset))
 
     def order_by(self, *keys: str | RowFunction) -> Query:
         """Sort the result; ``"name"`` ascends, ``"-name"`` descends.
@@ -133,49 +142,15 @@ class Query:
             raise ValueError("duplicate output names; use keyword aliases")
         return replace(self, outputs=outputs | computed)
 
-    def distinct(self) -> Query:
-        """Drop duplicate result rows.
+    def where(self, predicate: RowPredicate) -> Query:
+        """Keep only rows for which ``predicate`` is true; calls combine with AND.
 
+        :param predicate: a function of the row.
         :return: the extended query.
         """
-        return replace(self, is_distinct=True)
-
-    def limit(self, count: int | None, offset: int = 0) -> Query:
-        """Return at most ``count`` rows, after skipping ``offset``.
-
-        :param count: the maximum number of rows, or ``None`` for no limit.
-        :param offset: the rows to skip first; 0 by default.
-        :return: the extended query.
-        """
-        return replace(self, bounds=(count, offset))
+        return replace(self, filters=(*self.filters, predicate))
 
     # -- planning ---------------------------------------------------------------
-    def plan(self) -> Operator:
-        """Return the physical plan chosen by the cost-based planner.
-
-        :return: the root operator.
-        """
-        return Planner(self).plan()
-
-    def plan_naive(self) -> Operator:
-        """Return Chapter 7's plan: joins in the written order, every filter on top.
-
-        :return: the root operator.
-        """
-        op: Operator = Scan(self.state.table(self.table), self.alias)
-        for jtable, jalias, on, kind in self.joins:
-            op = NestedLoopJoin(op, Scan(self.state.table(jtable), jalias), on, kind)
-        for predicate in self.filters:
-            op = Filter(op, predicate)
-        return self.finish_plan(op)
-
-    def finish_plan(self, op: Operator) -> Operator:
-        """Add GROUP BY, HAVING, ORDER BY, SELECT, DISTINCT and LIMIT on top of ``op``.
-
-        :param op: the plan for FROM, JOIN and WHERE.
-        :return: the complete plan.
-        """
-        return self._shape(self._group(op))
 
     def _group(self, op: Operator) -> Operator:
         if self.grouping is not None:
@@ -195,7 +170,35 @@ class Query:
             op = Limit(op, *self.bounds)
         return op
 
+    def finish_plan(self, op: Operator) -> Operator:
+        """Add GROUP BY, HAVING, ORDER BY, SELECT, DISTINCT and LIMIT on top of ``op``.
+
+        :param op: the plan for FROM, JOIN and WHERE.
+        :return: the complete plan.
+        """
+        return self._shape(self._group(op))
+
+    def plan(self) -> Operator:
+        """Return the physical plan chosen by the cost-based planner.
+
+        :return: the root operator.
+        """
+        return Planner(self).plan()
+
+    def plan_naive(self) -> Operator:
+        """Return Chapter 7's plan: joins in the written order, every filter on top.
+
+        :return: the root operator.
+        """
+        op: Operator = Scan(self.state.table(self.table), self.alias)
+        for jtable, jalias, on, kind in self.joins:
+            op = NestedLoopJoin(op, Scan(self.state.table(jtable), jalias), on, kind)
+        for predicate in self.filters:
+            op = Filter(op, predicate)
+        return self.finish_plan(op)
+
     # -- running ----------------------------------------------------------------
+
     def __iter__(self) -> Iterator[Row]:
         with self.state.reading():
             rows = list(self.plan())  # materialize while protected
@@ -209,6 +212,13 @@ class Query:
         with self.state.reading():
             return [dict(row) for row in self.plan()]
 
+    def explain(self) -> str:
+        """Describe the plan, one operator per line.
+
+        :return: the description.
+        """
+        return self.plan().explain()
+
     def first(self) -> dict[str, Value | None] | None:
         """Run the query and return its first row.
 
@@ -216,10 +226,3 @@ class Query:
         """
         rows = self.limit(1).all()
         return rows[0] if rows else None
-
-    def explain(self) -> str:
-        """Describe the plan, one operator per line.
-
-        :return: the description.
-        """
-        return self.plan().explain()

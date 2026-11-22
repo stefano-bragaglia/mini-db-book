@@ -31,6 +31,10 @@ if TYPE_CHECKING:
 type Predicate = Callable[[Mapping[str, Value | None]], object]
 type Where = Predicate | Mapping[str, object] | None
 
+INDEX_KINDS: dict[str, IndexFactory] = {"hash": HashIndex, "sorted": SortedIndex}
+
+INDEX_KINDS["btree"] = BTreeIndex
+
 
 class Table:
     """Hold the rows of one table, keyed by rowid, and keep its indexes in step.
@@ -65,6 +69,22 @@ class Table:
         return len(self.rows)
 
     # -- indexes ------------------------------------------------------------------
+
+    def _fill(self, index: Index) -> None:
+        """Add every existing row to a new index, refusing duplicates if it is unique."""
+        for rowid, row in self.rows.items():
+            key = index.key_of(row)
+            if index.unique and key is not None and index.lookup(key):
+                raise UniqueError(f"{self.name}: cannot create unique index {index.name!r}: duplicate key {key}")
+            index.add(rowid, row)
+
+    def committed(self) -> Table:
+        """Return the table itself: a table is its own committed state.
+
+        :return: ``self``.
+        """
+        return self
+
     def create_index(self, name: str, columns: Iterable[str], *, unique: bool = False, kind: str = "hash") -> Index:
         """Create an index over the existing rows, and maintain it from now on.
 
@@ -89,13 +109,14 @@ class Table:
         self.indexes[name] = index
         return index
 
-    def _fill(self, index: Index) -> None:
-        """Add every existing row to a new index, refusing duplicates if it is unique."""
-        for rowid, row in self.rows.items():
-            key = index.key_of(row)
-            if index.unique and key is not None and index.lookup(key):
-                raise UniqueError(f"{self.name}: cannot create unique index {index.name!r}: duplicate key {key}")
-            index.add(rowid, row)
+    def index_on(self, columns: Iterable[str]) -> Index | None:
+        """Return an index on exactly these columns, in any order, or ``None``.
+
+        :param columns: the columns the index must cover.
+        :return: such an index, or ``None``.
+        """
+        wanted = set(columns)
+        return next((i for i in self.indexes.values() if set(i.columns) == wanted), None)
 
     def range(
         self,
@@ -126,22 +147,6 @@ class Table:
             hi_inclusive=hi_inclusive,
         )
 
-    def committed(self) -> Table:
-        """Return the table itself: a table is its own committed state.
-
-        :return: ``self``.
-        """
-        return self
-
-    def index_on(self, columns: Iterable[str]) -> Index | None:
-        """Return an index on exactly these columns, in any order, or ``None``.
-
-        :param columns: the columns the index must cover.
-        :return: such an index, or ``None``.
-        """
-        wanted = set(columns)
-        return next((i for i in self.indexes.values() if set(i.columns) == wanted), None)
-
     def unique_keys(self) -> list[tuple[str, ...]]:
         """Return the column tuples of every unique index.
 
@@ -150,6 +155,20 @@ class Table:
         return [i.columns for i in self.indexes.values() if i.unique]
 
     # -- primitives: no validation ---------------------------------------------------
+
+    def new_rowid(self) -> int:
+        """Hand out the next rowid; rowids are never reused.
+
+        Planning happens outside the exclusive lock, so the counter has a
+        small latch of its own.
+
+        :return: a rowid no row has ever had.
+        """
+        with self._rowid_latch:
+            rowid = self._next_rowid
+            self._next_rowid += 1
+            return rowid
+
     def put(self, rowid: int, row: Row) -> None:
         """Store ``row`` at ``rowid``, replacing any old row, and update every index.
 
@@ -173,28 +192,26 @@ class Table:
         for index in self.indexes.values():
             index.remove(rowid, old)
 
-    def new_rowid(self) -> int:
-        """Hand out the next rowid; rowids are never reused.
-
-        Planning happens outside the exclusive lock, so the counter has a
-        small latch of its own.
-
-        :return: a rowid no row has ever had.
-        """
-        with self._rowid_latch:
-            rowid = self._next_rowid
-            self._next_rowid += 1
-            return rowid
-
     # -- reads -------------------------------------------------------------------------
-    def row(self, rowid: int) -> Row:
-        """Return the stored row itself; callers must never mutate it.
 
-        :param rowid: the row to fetch.
-        :return: the stored row.
-        :raises KeyError: if there is no such row.
-        """
-        return self.rows[rowid]
+    @property
+    def next_rowid(self) -> int:
+        """Return the rowid the next insert will get."""
+        return self._next_rowid
+
+    def _match_equal(self, equal: Mapping[str, object]) -> list[int]:
+        """Find rows by equalities, through the index covering most of the columns."""
+        wanted = {c: self.schema.column(c).prepare(v) for c, v in equal.items()}
+        best = max(
+            (i for i in self.indexes.values() if set(i.columns) <= set(wanted)),
+            key=lambda i: len(i.columns),
+            default=None,
+        )
+        if best is not None:
+            candidates: Iterable[int] = best.lookup(tuple(wanted[c] for c in best.columns))
+        else:
+            candidates = self.rows.keys()
+        return [rid for rid in candidates if all(self.rows[rid][c] == v and v is not None for c, v in wanted.items())]
 
     def get(self, rowid: int) -> Row | None:
         """Return a copy of the row with ``rowid``, or ``None`` if there is none.
@@ -204,14 +221,6 @@ class Table:
         """
         row = self.rows.get(rowid)
         return dict(row) if row is not None else None
-
-    def scan(self) -> Iterator[tuple[int, Row]]:
-        """Yield every ``(rowid, row)`` pair, each row a fresh copy.
-
-        :return: an iterator over the table, in insertion order.
-        """
-        for rowid, row in self.rows.items():
-            yield rowid, dict(row)
 
     def lookup(self, key: Mapping[str, Value | None]) -> set[int]:
         """Return the rowids whose columns equal ``key``, through an index.
@@ -241,33 +250,6 @@ class Table:
             return [rid for rid, row in self.rows.items() if where(MappingProxyType(row))]
         return self._match_equal(where)
 
-    def _match_equal(self, equal: Mapping[str, object]) -> list[int]:
-        """Find rows by equalities, through the index covering most of the columns."""
-        wanted = {c: self.schema.column(c).prepare(v) for c, v in equal.items()}
-        best = max(
-            (i for i in self.indexes.values() if set(i.columns) <= set(wanted)),
-            key=lambda i: len(i.columns),
-            default=None,
-        )
-        if best is not None:
-            candidates: Iterable[int] = best.lookup(tuple(wanted[c] for c in best.columns))
-        else:
-            candidates = self.rows.keys()
-        return [rid for rid in candidates if all(self.rows[rid][c] == v and v is not None for c, v in wanted.items())]
-
-    def select(self, where: Where = None) -> list[Row]:
-        """Return copies of the rows matching ``where``; see :meth:`match`.
-
-        :param where: which rows to return; ``None`` (the default) for all.
-        :return: the matching rows.
-        """
-        return [dict(self.rows[rid]) for rid in self.match(where)]
-
-    @property
-    def next_rowid(self) -> int:
-        """Return the rowid the next insert will get."""
-        return self._next_rowid
-
     def reserve_rowid(self, rowid: int) -> None:
         """Make sure the counter never hands out ``rowid``, or anything below it.
 
@@ -276,8 +258,27 @@ class Table:
         with self._rowid_latch:
             self._next_rowid = max(self._next_rowid, rowid + 1)
 
+    def row(self, rowid: int) -> Row:
+        """Return the stored row itself; callers must never mutate it.
 
-INDEX_KINDS: dict[str, IndexFactory] = {"hash": HashIndex, "sorted": SortedIndex}
+        :param rowid: the row to fetch.
+        :return: the stored row.
+        :raises KeyError: if there is no such row.
+        """
+        return self.rows[rowid]
 
+    def scan(self) -> Iterator[tuple[int, Row]]:
+        """Yield every ``(rowid, row)`` pair, each row a fresh copy.
 
-INDEX_KINDS["btree"] = BTreeIndex
+        :return: an iterator over the table, in insertion order.
+        """
+        for rowid, row in self.rows.items():
+            yield rowid, dict(row)
+
+    def select(self, where: Where = None) -> list[Row]:
+        """Return copies of the rows matching ``where``; see :meth:`match`.
+
+        :param where: which rows to return; ``None`` (the default) for all.
+        :return: the matching rows.
+        """
+        return [dict(self.rows[rid]) for rid in self.match(where)]

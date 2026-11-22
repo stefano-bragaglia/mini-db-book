@@ -30,25 +30,49 @@ class Index(Protocol):
     columns: tuple[str, ...]
     unique: bool
 
-    def key_of(self, row: Mapping[str, Value | None]) -> Key | None:
-        """Return the row's key, or ``None`` if any of its values is NULL."""
-        ...
-
     def add(self, rowid: int, row: Mapping[str, Value | None]) -> None:
         """Record that ``rowid`` holds ``row``."""
         ...
 
-    def remove(self, rowid: int, row: Mapping[str, Value | None]) -> None:
-        """Forget that ``rowid`` holds ``row``."""
+    def distinct_keys(self) -> int:
+        """Return the number of different keys in the index."""
+        ...
+
+    def key_of(self, row: Mapping[str, Value | None]) -> Key | None:
+        """Return the row's key, or ``None`` if any of its values is NULL."""
         ...
 
     def lookup(self, key: Key) -> set[int]:
         """Return the rowids whose key equals ``key``, as a new set."""
         ...
 
-    def distinct_keys(self) -> int:
-        """Return the number of different keys in the index."""
+    def remove(self, rowid: int, row: Mapping[str, Value | None]) -> None:
+        """Forget that ``rowid`` holds ``row``."""
         ...
+
+
+class IndexFactory(Protocol):
+    """Describe what makes an index: any index class's constructor fits."""
+
+    def __call__(self, name: str, columns: Iterable[str], *, unique: bool = False) -> Index:
+        """Create an empty index."""
+        ...
+
+
+@runtime_checkable
+class OrderedIndex(Index, Protocol):
+    """Describe an index that also answers range queries, in key order."""
+
+    def range(
+        self, lo: Key | None, hi: Key | None, *, lo_inclusive: bool = True, hi_inclusive: bool = True
+    ) -> list[int]:
+        """Return the rowids with ``lo <= key <= hi``, in key order; ``None`` bounds are open."""
+        ...
+
+
+def _beyond(key: Key, hi: Key | None, *, hi_inclusive: bool) -> bool:
+    """Tell whether ``key`` lies past the upper bound ``hi``."""
+    return hi is not None and (key > hi or (key == hi and not hi_inclusive))
 
 
 class KeyedIndex:
@@ -97,6 +121,10 @@ class HashIndex(KeyedIndex):
         super().__init__(name, columns, unique=unique)
         self._entries: dict[Key, set[int]] = {}
 
+    def __repr__(self) -> str:
+        u = "unique " if self.unique else ""
+        return f"<{u}{self.kind} index {self.name} on {self.columns}>"
+
     def add(self, rowid: int, row: Mapping[str, Value | None]) -> None:
         """Record that ``rowid`` holds ``row``.
 
@@ -106,6 +134,18 @@ class HashIndex(KeyedIndex):
         key = self.key_of(row)
         if key is not None:
             self._entries.setdefault(key, set()).add(rowid)
+
+    def distinct_keys(self) -> int:
+        """Return the number of different keys in the index."""
+        return len(self._entries)
+
+    def lookup(self, key: Key) -> set[int]:
+        """Return the rowids whose key equals ``key``.
+
+        :param key: the key to look up.
+        :return: a new set, which the caller may modify.
+        """
+        return set(self._entries.get(tuple(key), ()))
 
     def remove(self, rowid: int, row: Mapping[str, Value | None]) -> None:
         """Forget that ``rowid`` holds ``row``, dropping keys left with no rows.
@@ -119,41 +159,6 @@ class HashIndex(KeyedIndex):
             ids.discard(rowid)
             if not ids:
                 del self._entries[key]  # don't keep empty buckets around
-
-    def lookup(self, key: Key) -> set[int]:
-        """Return the rowids whose key equals ``key``.
-
-        :param key: the key to look up.
-        :return: a new set, which the caller may modify.
-        """
-        return set(self._entries.get(tuple(key), ()))
-
-    def distinct_keys(self) -> int:
-        """Return the number of different keys in the index."""
-        return len(self._entries)
-
-    def __repr__(self) -> str:
-        u = "unique " if self.unique else ""
-        return f"<{u}{self.kind} index {self.name} on {self.columns}>"
-
-
-@runtime_checkable
-class OrderedIndex(Index, Protocol):
-    """Describe an index that also answers range queries, in key order."""
-
-    def range(
-        self, lo: Key | None, hi: Key | None, *, lo_inclusive: bool = True, hi_inclusive: bool = True
-    ) -> list[int]:
-        """Return the rowids with ``lo <= key <= hi``, in key order; ``None`` bounds are open."""
-        ...
-
-
-class IndexFactory(Protocol):
-    """Describe what makes an index: any index class's constructor fits."""
-
-    def __call__(self, name: str, columns: Iterable[str], *, unique: bool = False) -> Index:
-        """Create an empty index."""
-        ...
 
 
 class SortedIndex(KeyedIndex):
@@ -178,6 +183,13 @@ class SortedIndex(KeyedIndex):
         super().__init__(name, columns, unique=unique)
         self._sorted: list[tuple[Key, int]] = []
 
+    def _start(self, lo: Key | None, *, lo_inclusive: bool) -> int:
+        if lo is None:
+            return 0
+        if lo_inclusive:
+            return bisect.bisect_left(self._sorted, (lo,))
+        return bisect.bisect_right(self._sorted, (lo, math.inf))  # after every (lo, rowid)
+
     def add(self, rowid: int, row: Mapping[str, Value | None]) -> None:
         """Record that ``rowid`` holds ``row``.
 
@@ -188,18 +200,9 @@ class SortedIndex(KeyedIndex):
         if key is not None:
             bisect.insort(self._sorted, (key, rowid))  # O(n): the list shifts
 
-    def remove(self, rowid: int, row: Mapping[str, Value | None]) -> None:
-        """Forget that ``rowid`` holds ``row``.
-
-        :param rowid: the row's rowid.
-        :param row: the values the row had when it was added.
-        """
-        key = self.key_of(row)
-        if key is None:
-            return
-        i = bisect.bisect_left(self._sorted, (key, rowid))
-        if i < len(self._sorted) and self._sorted[i] == (key, rowid):
-            del self._sorted[i]
+    def distinct_keys(self) -> int:
+        """Return the number of different keys in the index."""
+        return sum(1 for _ in itertools.groupby(self._sorted, key=lambda e: e[0]))
 
     def lookup(self, key: Key) -> set[int]:
         """Return the rowids whose key equals ``key``.
@@ -233,18 +236,15 @@ class SortedIndex(KeyedIndex):
             i += 1
         return found
 
-    def _start(self, lo: Key | None, *, lo_inclusive: bool) -> int:
-        if lo is None:
-            return 0
-        if lo_inclusive:
-            return bisect.bisect_left(self._sorted, (lo,))
-        return bisect.bisect_right(self._sorted, (lo, math.inf))  # after every (lo, rowid)
+    def remove(self, rowid: int, row: Mapping[str, Value | None]) -> None:
+        """Forget that ``rowid`` holds ``row``.
 
-    def distinct_keys(self) -> int:
-        """Return the number of different keys in the index."""
-        return sum(1 for _ in itertools.groupby(self._sorted, key=lambda e: e[0]))
-
-
-def _beyond(key: Key, hi: Key | None, *, hi_inclusive: bool) -> bool:
-    """Tell whether ``key`` lies past the upper bound ``hi``."""
-    return hi is not None and (key > hi or (key == hi and not hi_inclusive))
+        :param rowid: the row's rowid.
+        :param row: the values the row had when it was added.
+        """
+        key = self.key_of(row)
+        if key is None:
+            return
+        i = bisect.bisect_left(self._sorted, (key, rowid))
+        if i < len(self._sorted) and self._sorted[i] == (key, rowid):
+            del self._sorted[i]

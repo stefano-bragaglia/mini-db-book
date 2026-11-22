@@ -20,14 +20,7 @@ if TYPE_CHECKING:
     from minidb.values import Ordered
     from minidb.values import Value
 
-
-class _Leaf[K: Ordered, V]:
-    __slots__ = ("keys", "next", "values")
-
-    def __init__(self) -> None:
-        self.keys: list[K] = []
-        self.values: list[set[V]] = []
-        self.next: _Leaf[K, V] | None = None
+type _Node[K: Ordered, V] = _Leaf[K, V] | _Internal[K, V]
 
 
 class _Internal[K: Ordered, V]:
@@ -38,7 +31,13 @@ class _Internal[K: Ordered, V]:
         self.children = children  # always len(keys) + 1 of them
 
 
-type _Node[K: Ordered, V] = _Leaf[K, V] | _Internal[K, V]
+class _Leaf[K: Ordered, V]:
+    __slots__ = ("keys", "next", "values")
+
+    def __init__(self) -> None:
+        self.keys: list[K] = []
+        self.values: list[set[V]] = []
+        self.next: _Leaf[K, V] | None = None
 
 
 class BPlusTree[K: Ordered, V]:
@@ -76,6 +75,7 @@ class BPlusTree[K: Ordered, V]:
         return h
 
     # -- search ---------------------------------------------------------------------------
+
     def _descend(self, key: K) -> tuple[_Leaf[K, V], list[_Internal[K, V]]]:
         """Return the leaf where ``key`` belongs, and the internal nodes on the way."""
         node, path = self.root, list[_Internal[K, V]]()
@@ -127,30 +127,6 @@ class BPlusTree[K: Ordered, V]:
             leaf, i = leaf.next, 0
 
     # -- insert ---------------------------------------------------------------------------
-    def insert(self, key: K, value: V) -> None:
-        """Store ``value`` under ``key``, splitting nodes that overflow.
-
-        :param key: the key.
-        :param value: the value to add to the key's set.
-        """
-        leaf, path = self._descend(key)
-        i = bisect.bisect_left(leaf.keys, key)
-        if i < len(leaf.keys) and leaf.keys[i] == key:
-            leaf.values[i].add(value)
-            return
-        leaf.keys.insert(i, key)
-        leaf.values.insert(i, {value})
-        self._len += 1
-        if len(leaf.keys) >= self.order:
-            self._split_leaf(leaf, path)
-
-    def _split_leaf(self, leaf: _Leaf[K, V], path: list[_Internal[K, V]]) -> None:
-        mid = len(leaf.keys) // 2
-        right = _Leaf[K, V]()
-        right.keys, leaf.keys = leaf.keys[mid:], leaf.keys[:mid]
-        right.values, leaf.values = leaf.values[mid:], leaf.values[:mid]
-        right.next, leaf.next = leaf.next, right
-        self._insert_in_parent(leaf, right.keys[0], right, path)
 
     def _insert_in_parent(
         self, left: _Node[K, V], separator: K, right: _Node[K, V], path: list[_Internal[K, V]]
@@ -169,7 +145,33 @@ class BPlusTree[K: Ordered, V]:
             parent.keys, parent.children = parent.keys[:mid], parent.children[: mid + 1]
             self._insert_in_parent(parent, up, sibling, path)
 
+    def _split_leaf(self, leaf: _Leaf[K, V], path: list[_Internal[K, V]]) -> None:
+        mid = len(leaf.keys) // 2
+        right = _Leaf[K, V]()
+        right.keys, leaf.keys = leaf.keys[mid:], leaf.keys[:mid]
+        right.values, leaf.values = leaf.values[mid:], leaf.values[:mid]
+        right.next, leaf.next = leaf.next, right
+        self._insert_in_parent(leaf, right.keys[0], right, path)
+
+    def insert(self, key: K, value: V) -> None:
+        """Store ``value`` under ``key``, splitting nodes that overflow.
+
+        :param key: the key.
+        :param value: the value to add to the key's set.
+        """
+        leaf, path = self._descend(key)
+        i = bisect.bisect_left(leaf.keys, key)
+        if i < len(leaf.keys) and leaf.keys[i] == key:
+            leaf.values[i].add(value)
+            return
+        leaf.keys.insert(i, key)
+        leaf.values.insert(i, {value})
+        self._len += 1
+        if len(leaf.keys) >= self.order:
+            self._split_leaf(leaf, path)
+
     # -- delete ---------------------------------------------------------------------------
+
     def remove(self, key: K, value: V) -> None:
         """Remove ``value`` from ``key``, dropping the key when its set is empty.
 
@@ -188,6 +190,7 @@ class BPlusTree[K: Ordered, V]:
                 self._len -= 1
 
     # -- for teaching ----------------------------------------------------------------------
+
     def dump(self) -> str:
         """Draw the tree's keys, one line per level.
 
@@ -226,15 +229,9 @@ class BTreeIndex(KeyedIndex):
         if key is not None:
             self.tree.insert(key, rowid)
 
-    def remove(self, rowid: int, row: Mapping[str, Value | None]) -> None:
-        """Forget that ``rowid`` holds ``row``.
-
-        :param rowid: the row's rowid.
-        :param row: the values the row had when it was added.
-        """
-        key = self.key_of(row)
-        if key is not None:
-            self.tree.remove(key, rowid)
+    def distinct_keys(self) -> int:
+        """Return the number of different keys in the index."""
+        return len(self.tree)
 
     def lookup(self, key: Key) -> set[int]:
         """Return the rowids whose key equals ``key``.
@@ -258,6 +255,12 @@ class BTreeIndex(KeyedIndex):
         items = self.tree.items(lo, hi, lo_inclusive=lo_inclusive, hi_inclusive=hi_inclusive)
         return [rowid for _, rowids in items for rowid in sorted(rowids)]
 
-    def distinct_keys(self) -> int:
-        """Return the number of different keys in the index."""
-        return len(self.tree)
+    def remove(self, rowid: int, row: Mapping[str, Value | None]) -> None:
+        """Forget that ``rowid`` holds ``row``.
+
+        :param rowid: the row's rowid.
+        :param row: the values the row had when it was added.
+        """
+        key = self.key_of(row)
+        if key is not None:
+            self.tree.remove(key, rowid)

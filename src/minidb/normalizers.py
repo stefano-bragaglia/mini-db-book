@@ -13,16 +13,16 @@ if TYPE_CHECKING:
     from minidb.values import Value
 
 
-def strip(value: Value) -> Value:
-    """Remove leading and trailing whitespace from text.
+def collapse_spaces(value: Value) -> Value:
+    """Trim text and replace each run of whitespace with a single space.
 
-    >>> strip("  Ada ")
-    'Ada'
+    >>> collapse_spaces("  Ada   Lovelace ")
+    'Ada Lovelace'
 
     :param value: the value to normalize.
-    :return: the stripped text, or ``value`` unchanged if it isn't text.
+    :return: the collapsed text, or ``value`` unchanged if it isn't text.
     """
-    return value.strip() if isinstance(value, str) else value
+    return " ".join(value.split()) if isinstance(value, str) else value
 
 
 def lower(value: Value) -> Value:
@@ -35,27 +35,6 @@ def lower(value: Value) -> Value:
     :return: the lower-cased text, or ``value`` unchanged if it isn't text.
     """
     return value.lower() if isinstance(value, str) else value
-
-
-def upper(value: Value) -> Value:
-    """Upper-case text.
-
-    :param value: the value to normalize.
-    :return: the upper-cased text, or ``value`` unchanged if it isn't text.
-    """
-    return value.upper() if isinstance(value, str) else value
-
-
-def collapse_spaces(value: Value) -> Value:
-    """Trim text and replace each run of whitespace with a single space.
-
-    >>> collapse_spaces("  Ada   Lovelace ")
-    'Ada Lovelace'
-
-    :param value: the value to normalize.
-    :return: the collapsed text, or ``value`` unchanged if it isn't text.
-    """
-    return " ".join(value.split()) if isinstance(value, str) else value
 
 
 def nfc(value: Value) -> Value:
@@ -71,3 +50,24 @@ def nfc(value: Value) -> Value:
     :return: the NFC form of the text, or ``value`` unchanged if it isn't text.
     """
     return unicodedata.normalize("NFC", value) if isinstance(value, str) else value
+
+
+def strip(value: Value) -> Value:
+    """Remove leading and trailing whitespace from text.
+
+    >>> strip("  Ada ")
+    'Ada'
+
+    :param value: the value to normalize.
+    :return: the stripped text, or ``value`` unchanged if it isn't text.
+    """
+    return value.strip() if isinstance(value, str) else value
+
+
+def upper(value: Value) -> Value:
+    """Upper-case text.
+
+    :param value: the value to normalize.
+    :return: the upper-cased text, or ``value`` unchanged if it isn't text.
+    """
+    return value.upper() if isinstance(value, str) else value

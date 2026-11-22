@@ -58,13 +58,6 @@ class Database:
         self._lock: RWLock = lock if lock is not None else FairRWLock()
         self._local = threading.local()
 
-    def shared_lock(self) -> AbstractContextManager[None]:
-        """Return a context manager that holds the database lock in shared mode.
-
-        :return: the context manager.
-        """
-        return self._lock.read()
-
     def exclusive_lock(self) -> AbstractContextManager[None]:
         """Return a context manager that holds the database lock exclusively.
 
@@ -72,7 +65,59 @@ class Database:
         """
         return self._lock.write()
 
+    def shared_lock(self) -> AbstractContextManager[None]:
+        """Return a context manager that holds the database lock in shared mode.
+
+        :return: the context manager.
+        """
+        return self._lock.read()
+
     # -- schema --------------------------------------------------------------------
+
+    @staticmethod
+    def _check_fk_columns(fk: ForeignKey, child: Table, parent: Table) -> None:
+        """Check that ``fk`` pairs columns of the same types and targets a key."""
+        if len(fk.columns) != len(fk.ref_columns):
+            raise SchemaError(f"{fk.name}: column count mismatch")
+        for c, r in zip(fk.columns, fk.ref_columns, strict=True):
+            if type(child.schema.column(c).type) is not type(parent.schema.column(r).type):
+                raise SchemaError(f"{fk.name}: {c} and {parent.name}.{r} differ in type")
+        target = parent.index_on(fk.ref_columns)
+        if target is None or not target.unique:
+            raise SchemaError(f"{fk.name}: {parent.name}{fk.ref_columns} is not a key")
+
+    def _add_foreign_key(self, fk: ForeignKey) -> None:
+        """Validate ``fk`` against both tables and the existing data, then register it."""
+        child, parent = self.table(fk.table), self.table(fk.ref_table)
+        if not fk.ref_columns:
+            if not parent.schema.primary_key:
+                raise SchemaError(f"{parent.name} has no primary key to reference")
+            fk = replace(fk, ref_columns=parent.schema.primary_key)
+        self._check_fk_columns(fk, child, parent)
+        if child.index_on(fk.columns) is None:
+            child.create_index(fk.name, fk.columns)
+        ch.check_parents_exist(self, child, child.rows.values(), [fk])
+        self.foreign_keys.append(fk)
+
+    def _forget_table(self, name: str) -> None:
+        del self.tables[name]
+        self.foreign_keys = [f for f in self.foreign_keys if f.table != name]
+
+    def create_index(
+        self, table: str, name: str, columns: Sequence[str], *, unique: bool = False, kind: str = "hash"
+    ) -> None:
+        """Create an index on ``table``, while no transaction commits.
+
+        :param table: the table's name.
+        :param name: the index's name.
+        :param columns: the indexed columns, in key order.
+        :param unique: whether to refuse duplicate keys; ``False`` by default.
+        :param kind: the kind of index, ``"hash"`` by default; see
+            :data:`minidb.table.INDEX_KINDS`.
+        """
+        with self.exclusive_lock():
+            self.table(table).create_index(name, columns, unique=unique, kind=kind)
+
     def create_table(
         self,
         name: str,
@@ -113,35 +158,6 @@ class Database:
             raise
         return table
 
-    def _forget_table(self, name: str) -> None:
-        del self.tables[name]
-        self.foreign_keys = [f for f in self.foreign_keys if f.table != name]
-
-    def _add_foreign_key(self, fk: ForeignKey) -> None:
-        """Validate ``fk`` against both tables and the existing data, then register it."""
-        child, parent = self.table(fk.table), self.table(fk.ref_table)
-        if not fk.ref_columns:
-            if not parent.schema.primary_key:
-                raise SchemaError(f"{parent.name} has no primary key to reference")
-            fk = replace(fk, ref_columns=parent.schema.primary_key)
-        self._check_fk_columns(fk, child, parent)
-        if child.index_on(fk.columns) is None:
-            child.create_index(fk.name, fk.columns)
-        ch.check_parents_exist(self, child, child.rows.values(), [fk])
-        self.foreign_keys.append(fk)
-
-    @staticmethod
-    def _check_fk_columns(fk: ForeignKey, child: Table, parent: Table) -> None:
-        """Check that ``fk`` pairs columns of the same types and targets a key."""
-        if len(fk.columns) != len(fk.ref_columns):
-            raise SchemaError(f"{fk.name}: column count mismatch")
-        for c, r in zip(fk.columns, fk.ref_columns, strict=True):
-            if type(child.schema.column(c).type) is not type(parent.schema.column(r).type):
-                raise SchemaError(f"{fk.name}: {c} and {parent.name}.{r} differ in type")
-        target = parent.index_on(fk.ref_columns)
-        if target is None or not target.unique:
-            raise SchemaError(f"{fk.name}: {parent.name}{fk.ref_columns} is not a key")
-
     def drop_table(self, name: str) -> None:
         """Delete a table that no other table references.
 
@@ -166,22 +182,8 @@ class Database:
         except KeyError:
             raise SchemaError(f"no such table: {name!r}") from None
 
-    def create_index(
-        self, table: str, name: str, columns: Sequence[str], *, unique: bool = False, kind: str = "hash"
-    ) -> None:
-        """Create an index on ``table``, while no transaction commits.
-
-        :param table: the table's name.
-        :param name: the index's name.
-        :param columns: the indexed columns, in key order.
-        :param unique: whether to refuse duplicate keys; ``False`` by default.
-        :param kind: the kind of index, ``"hash"`` by default; see
-            :data:`minidb.table.INDEX_KINDS`.
-        """
-        with self.exclusive_lock():
-            self.table(table).create_index(name, columns, unique=unique, kind=kind)
-
     # -- reads ---------------------------------------------------------------------
+
     def get(self, table: str, rowid: int) -> Row | None:
         """Return a copy of one row, or ``None``; see :meth:`Table.get`.
 
@@ -191,6 +193,15 @@ class Database:
         """
         with self.reading():
             return self.table(table).get(rowid)
+
+    def query(self, table: str, alias: str | None = None) -> Query:
+        """Start a query on ``table``; see :class:`Query`.
+
+        :param table: the first table.
+        :param alias: its alias; ``None`` (the default) uses its name.
+        :return: a query to extend and run.
+        """
+        return Query(self, table, alias)
 
     def select(self, table: str, where: Where = None) -> list[Row]:
         """Return the rows of ``table`` matching ``where``; see :meth:`Table.match`.
@@ -202,46 +213,34 @@ class Database:
         with self.reading():
             return self.table(table).select(where)
 
-    def query(self, table: str, alias: str | None = None) -> Query:
-        """Start a query on ``table``; see :class:`Query`.
-
-        :param table: the first table.
-        :param alias: its alias; ``None`` (the default) uses its name.
-        :return: a query to extend and run.
-        """
-        return Query(self, table, alias)
-
     # -- writes ----------------------------------------------------------------------
-    def insert(self, table: str, values: Mapping[str, object]) -> int:
-        """Insert a row, in a transaction of its own.
 
-        :param table: the table's name.
-        :param values: the new row's values, by column name.
-        :return: the new rowid.
-        :raises ConstraintError: if the row breaks a constraint.
-        """
-        return self.transaction(lambda uow: uow.insert(table, values))
+    @staticmethod
+    def _attempt[T](uow: UnitOfWork, fn: Callable[[UnitOfWork], T]) -> T:
+        try:
+            result = fn(uow)
+            uow.commit()
+        except BaseException:
+            if uow.state == "active":
+                uow.rollback()
+            raise
+        return result
 
-    def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
-        """Update rows, in a transaction of its own.
+    def _apply_one(self, table: str, rowid: int, row: Row | None, seq: int) -> None:
+        t = self.tables[table]
+        if row is None:
+            if rowid in t.rows:
+                t.remove(rowid)
+            t.row_versions.pop(rowid, None)
+        else:
+            t.put(rowid, row)
+            t.row_versions[rowid] = seq
+            t.reserve_rowid(rowid)
+        t.version = seq
 
-        :param table: the table's name.
-        :param changes: the new values, by column name.
-        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
-        :return: the number of rows changed.
-        :raises ConstraintError: if a new row breaks a constraint.
-        """
-        return self.transaction(lambda uow: uow.update(table, changes, where))
-
-    def delete(self, table: str, where: Where = None) -> int:
-        """Delete rows and their cascades, in a transaction of its own.
-
-        :param table: the table's name.
-        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
-        :return: the number of rows deleted from ``table`` itself.
-        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
-        """
-        return self.transaction(lambda uow: uow.delete(table, where))
+    def _encode(self, c: Change) -> tuple[str, int, list[Primitive] | None]:
+        values = None if c.after is None else encode_row(self.tables[c.table].schema, c.after)
+        return (c.table, c.rowid, values)
 
     def apply(self, changes: Sequence[Change]) -> None:
         """Write validated changes as one commit: log first, then memory.
@@ -257,34 +256,25 @@ class Database:
         for c in changes:
             self._apply_one(c.table, c.rowid, c.after, seq)
 
-    def _encode(self, c: Change) -> tuple[str, int, list[Primitive] | None]:
-        values = None if c.after is None else encode_row(self.tables[c.table].schema, c.after)
-        return (c.table, c.rowid, values)
+    def delete(self, table: str, where: Where = None) -> int:
+        """Delete rows and their cascades, in a transaction of its own.
 
-    def _apply_one(self, table: str, rowid: int, row: Row | None, seq: int) -> None:
-        t = self.tables[table]
-        if row is None:
-            if rowid in t.rows:
-                t.remove(rowid)
-            t.row_versions.pop(rowid, None)
-        else:
-            t.put(rowid, row)
-            t.row_versions[rowid] = seq
-            t.reserve_rowid(rowid)
-        t.version = seq
-
-    def unit_of_work(self, *, deferred: bool = False, readonly: bool = False, exclusive: bool = False) -> UnitOfWork:
-        """Start a transaction; see :class:`UnitOfWork`.
-
-        :param deferred: whether to check multi-row constraints only at
-            commit; ``False`` by default.
-        :param readonly: whether the transaction only reads; it then holds
-            the lock in shared mode and never conflicts; ``False`` by default.
-        :param exclusive: whether to hold the lock alone for the whole
-            transaction, so it can't conflict; ``False`` by default.
-        :return: a new, active unit of work.
+        :param table: the table's name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
+        :return: the number of rows deleted from ``table`` itself.
+        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
         """
-        return UnitOfWork(self, deferred=deferred, readonly=readonly, exclusive=exclusive)
+        return self.transaction(lambda uow: uow.delete(table, where))
+
+    def insert(self, table: str, values: Mapping[str, object]) -> int:
+        """Insert a row, in a transaction of its own.
+
+        :param table: the table's name.
+        :param values: the new row's values, by column name.
+        :return: the new rowid.
+        :raises ConstraintError: if the row breaks a constraint.
+        """
+        return self.transaction(lambda uow: uow.insert(table, values))
 
     def transaction[T](self, fn: Callable[[UnitOfWork], T], *, retries: int = 5, deferred: bool = False) -> T:
         """Run ``fn(uow)`` and commit, retrying when another transaction conflicts.
@@ -315,18 +305,32 @@ class Database:
                 time.sleep(random.uniform(0, 0.0005 * 2**attempt))  # noqa: S311 - back-off jitter, not cryptography
         return self._attempt(self.unit_of_work(deferred=deferred, exclusive=True), fn)
 
-    @staticmethod
-    def _attempt[T](uow: UnitOfWork, fn: Callable[[UnitOfWork], T]) -> T:
-        try:
-            result = fn(uow)
-            uow.commit()
-        except BaseException:
-            if uow.state == "active":
-                uow.rollback()
-            raise
-        return result
+    def unit_of_work(self, *, deferred: bool = False, readonly: bool = False, exclusive: bool = False) -> UnitOfWork:
+        """Start a transaction; see :class:`UnitOfWork`.
+
+        :param deferred: whether to check multi-row constraints only at
+            commit; ``False`` by default.
+        :param readonly: whether the transaction only reads; it then holds
+            the lock in shared mode and never conflicts; ``False`` by default.
+        :param exclusive: whether to hold the lock alone for the whole
+            transaction, so it can't conflict; ``False`` by default.
+        :return: a new, active unit of work.
+        """
+        return UnitOfWork(self, deferred=deferred, readonly=readonly, exclusive=exclusive)
+
+    def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
+        """Update rows, in a transaction of its own.
+
+        :param table: the table's name.
+        :param changes: the new values, by column name.
+        :param where: a predicate, a dict of equalities, or ``None`` for all rows.
+        :return: the number of rows changed.
+        :raises ConstraintError: if a new row breaks a constraint.
+        """
+        return self.transaction(lambda uow: uow.update(table, changes, where))
 
     # -- concurrency control ------------------------------------------------------------
+
     def active_unit_of_work(self) -> UnitOfWork | None:
         """Return the calling thread's active unit of work, if it has one.
 
@@ -377,6 +381,40 @@ class Database:
             yield self
 
     # -- persistence ---------------------------------------------------------------------
+
+    def _check_attachable(self) -> None:
+        if self.storage is not None:
+            raise SchemaError("storage already attached")
+        if any(len(t) for t in self.tables.values()):
+            raise SchemaError("attach storage before inserting data")
+
+    def _fingerprint(self) -> str:
+        return schema_fingerprint(self.tables, self.foreign_keys)
+
+    def _load_state(self, state: Snapshot) -> None:
+        if state["fingerprint"] != self._fingerprint():
+            raise SchemaError("stored data was written with a different schema")
+        self.commit_seq = state["commit_seq"]
+        for name, data in state["tables"].items():
+            t = self.tables[name]
+            for rowid, values in data["rows"]:
+                t.put(rowid, decode_row(t.schema, values))
+                t.row_versions[rowid] = self.commit_seq
+            t.reserve_rowid(data["next_rowid"] - 1)
+            t.version = self.commit_seq
+
+    def _replay(self, record: LogRecord) -> None:
+        for table, rowid, values in record["changes"]:
+            row = None if values is None else decode_row(self.tables[table].schema, values)
+            self._apply_one(table, rowid, row, record["seq"])
+        self.commit_seq = record["seq"]
+
+    def analyze(self) -> None:
+        """Count the distinct values of every column, for the planner (like SQL's ANALYZE)."""
+        with self.reading():
+            for t in self.tables.values():
+                t.stats = {c: len({row[c] for row in t.rows.values()} - {None}) for c in t.columns}
+
     def attach(self, storage: Storage) -> None:
         """Load the saved data, and log every future commit to ``storage``.
 
@@ -396,18 +434,6 @@ class Database:
                 if record["seq"] > self.commit_seq:  # else it is in the snapshot already
                     self._replay(record)
             self.storage = storage
-
-    def _check_attachable(self) -> None:
-        if self.storage is not None:
-            raise SchemaError("storage already attached")
-        if any(len(t) for t in self.tables.values()):
-            raise SchemaError("attach storage before inserting data")
-
-    def _replay(self, record: LogRecord) -> None:
-        for table, rowid, values in record["changes"]:
-            row = None if values is None else decode_row(self.tables[table].schema, values)
-            self._apply_one(table, rowid, row, record["seq"])
-        self.commit_seq = record["seq"]
 
     def checkpoint(self) -> None:
         """Write a snapshot and empty the log. Writers wait; readers don't.
@@ -429,28 +455,7 @@ class Database:
             )
             self.storage.truncate_log()
 
-    def _fingerprint(self) -> str:
-        return schema_fingerprint(self.tables, self.foreign_keys)
-
-    def _load_state(self, state: Snapshot) -> None:
-        if state["fingerprint"] != self._fingerprint():
-            raise SchemaError("stored data was written with a different schema")
-        self.commit_seq = state["commit_seq"]
-        for name, data in state["tables"].items():
-            t = self.tables[name]
-            for rowid, values in data["rows"]:
-                t.put(rowid, decode_row(t.schema, values))
-                t.row_versions[rowid] = self.commit_seq
-            t.reserve_rowid(data["next_rowid"] - 1)
-            t.version = self.commit_seq
-
     def close(self) -> None:
         """Close the attached storage's files, if any."""
         if self.storage is not None:
             self.storage.close()
-
-    def analyze(self) -> None:
-        """Count the distinct values of every column, for the planner (like SQL's ANALYZE)."""
-        with self.reading():
-            for t in self.tables.values():
-                t.stats = {c: len({row[c] for row in t.rows.values()} - {None}) for c in t.columns}

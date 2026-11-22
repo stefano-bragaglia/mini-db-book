@@ -18,20 +18,20 @@ class RWLock(Protocol):
         """Wait until the lock can be held in shared mode, and take it."""
         ...
 
-    def release_read(self) -> None:
-        """Release a shared hold."""
-        ...
-
     def acquire_write(self) -> None:
         """Wait until the lock can be held exclusively, and take it."""
         ...
 
-    def release_write(self) -> None:
-        """Release the exclusive hold."""
-        ...
-
     def read(self) -> AbstractContextManager[None]:
         """Return a context manager that holds the lock in shared mode."""
+        ...
+
+    def release_read(self) -> None:
+        """Release a shared hold."""
+        ...
+
+    def release_write(self) -> None:
+        """Release the exclusive hold."""
         ...
 
     def write(self) -> AbstractContextManager[None]:
@@ -50,16 +50,8 @@ class RWLockBase:
         """Wait until the lock can be held in shared mode, and take it."""
         raise NotImplementedError
 
-    def release_read(self) -> None:
-        """Release a shared hold."""
-        raise NotImplementedError
-
     def acquire_write(self) -> None:
         """Wait until the lock can be held exclusively, and take it."""
-        raise NotImplementedError
-
-    def release_write(self) -> None:
-        """Release the exclusive hold."""
         raise NotImplementedError
 
     @contextmanager
@@ -73,6 +65,14 @@ class RWLockBase:
             yield
         finally:
             self.release_read()
+
+    def release_read(self) -> None:
+        """Release a shared hold."""
+        raise NotImplementedError
+
+    def release_write(self) -> None:
+        """Release the exclusive hold."""
+        raise NotImplementedError
 
     @contextmanager
     def write(self) -> Iterator[None]:
@@ -105,42 +105,10 @@ class ReaderPreferringLock(RWLockBase):
             self._readers += 1
 
     @override
-    def release_read(self) -> None:
-        with self._cond:
-            self._readers -= 1
-            if self._readers == 0:
-                self._cond.notify_all()
-
-    @override
     def acquire_write(self) -> None:
         with self._cond:
             self._cond.wait_for(lambda: not self._writer and self._readers == 0)
             self._writer = True
-
-    @override
-    def release_write(self) -> None:
-        with self._cond:
-            self._writer = False
-            self._cond.notify_all()
-
-
-class WriterPreferringLock(RWLockBase):
-    """Make new readers wait while a writer waits: Courtois et al.'s second problem.
-
-    A steady stream of writers starves readers forever.
-    """
-
-    def __init__(self) -> None:
-        self._cond = threading.Condition()
-        self._readers = 0
-        self._writer = False
-        self._writers_waiting = 0
-
-    @override
-    def acquire_read(self) -> None:
-        with self._cond:
-            self._cond.wait_for(lambda: not self._writer and self._writers_waiting == 0)
-            self._readers += 1
 
     @override
     def release_read(self) -> None:
@@ -148,14 +116,6 @@ class WriterPreferringLock(RWLockBase):
             self._readers -= 1
             if self._readers == 0:
                 self._cond.notify_all()
-
-    @override
-    def acquire_write(self) -> None:
-        with self._cond:
-            self._writers_waiting += 1
-            self._cond.wait_for(lambda: not self._writer and self._readers == 0)
-            self._writers_waiting -= 1
-            self._writer = True
 
     @override
     def release_write(self) -> None:
@@ -199,6 +159,14 @@ class FairRWLock(RWLockBase):
             self._cond.notify_all()  # the next ticket may be a reader too
 
     @override
+    def acquire_write(self) -> None:
+        with self._cond:
+            ticket = self._take_ticket()
+            self._cond.wait_for(lambda: self._serving == ticket and not self._writer and self._readers == 0)
+            self._writer = True
+            self._serving += 1
+
+    @override
     def release_read(self) -> None:
         with self._cond:
             self._readers -= 1
@@ -206,12 +174,44 @@ class FairRWLock(RWLockBase):
                 self._cond.notify_all()  # a writer may be waiting at the head
 
     @override
+    def release_write(self) -> None:
+        with self._cond:
+            self._writer = False
+            self._cond.notify_all()
+
+
+class WriterPreferringLock(RWLockBase):
+    """Make new readers wait while a writer waits: Courtois et al.'s second problem.
+
+    A steady stream of writers starves readers forever.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition()
+        self._readers = 0
+        self._writer = False
+        self._writers_waiting = 0
+
+    @override
+    def acquire_read(self) -> None:
+        with self._cond:
+            self._cond.wait_for(lambda: not self._writer and self._writers_waiting == 0)
+            self._readers += 1
+
+    @override
     def acquire_write(self) -> None:
         with self._cond:
-            ticket = self._take_ticket()
-            self._cond.wait_for(lambda: self._serving == ticket and not self._writer and self._readers == 0)
+            self._writers_waiting += 1
+            self._cond.wait_for(lambda: not self._writer and self._readers == 0)
+            self._writers_waiting -= 1
             self._writer = True
-            self._serving += 1
+
+    @override
+    def release_read(self) -> None:
+        with self._cond:
+            self._readers -= 1
+            if self._readers == 0:
+                self._cond.notify_all()
 
     @override
     def release_write(self) -> None:

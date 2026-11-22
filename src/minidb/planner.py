@@ -35,73 +35,25 @@ if TYPE_CHECKING:
     from minidb.query import Query
     from minidb.values import Value
 
+type Bounds = tuple[Value | None, Value | None, bool, bool]  # lo, hi, lo_inclusive, hi_inclusive
+
 type Candidate = tuple[float, Operator, list[Expr]]  # (cost, access path, conditions it consumes)
 type RangeCondition = tuple[CompareOp, Value, Expr]
-type Bounds = tuple[Value | None, Value | None, bool, bool]  # lo, hi, lo_inclusive, hi_inclusive
 
 
 # -- physical operators that need indexes or hashing ----------------------------------------
-class IndexLookup(Operator):
-    """Yield the rows whose indexed columns equal ``key``, without a scan.
-
-    :param source: the table or view.
-    :param alias: the qualifier for column names.
-    :param index_name: the index used, for :meth:`explain`.
-    :param key: ``{column: value}`` to look up.
-    """
-
-    def __init__(self, source: PlannedSource, alias: str, index_name: str, key: dict[str, Value | None]) -> None:
-        self.source, self.alias, self.index_name, self.key = source, alias, index_name, key
-
-    @override
-    def __iter__(self) -> Iterator[Row]:
-        for rid in self.source.lookup(self.key):
-            row = self.source.row(rid)
-            yield Row({f"{self.alias}.{c}": row[c] for c in self.source.columns})
-
-    @override
-    def columns(self) -> list[str]:
-        return [f"{self.alias}.{c}" for c in self.source.columns]
-
-    @property
-    @override
-    def label(self) -> str:
-        return f"IndexLookup {self.source.name} AS {self.alias} using {self.index_name} {self.key}"
+def _buckets(rows: Operator, keys: list[Expr]) -> dict[tuple[Value | None, ...], list[Row]]:
+    """Group ``rows`` by their join key, leaving out keys with NULL: NULL never joins."""
+    buckets: dict[tuple[Value | None, ...], list[Row]] = {}
+    for row in rows:
+        key = tuple(k.eval(row) for k in keys)
+        if not any(v is None for v in key):
+            buckets.setdefault(key, []).append(row)
+    return buckets
 
 
-class IndexRange(Operator):
-    """Yield the rows whose ``column`` lies between ``lo`` and ``hi``, through an ordered index.
-
-    :param source: the table or view.
-    :param alias: the qualifier for column names.
-    :param index_name: the index used, for :meth:`explain`.
-    :param column: the indexed column.
-    :param bounds: ``(lo, hi, lo_inclusive, hi_inclusive)``; a ``None``
-        bound is open.
-    """
-
-    def __init__(self, source: PlannedSource, alias: str, index_name: str, column: str, bounds: Bounds) -> None:
-        self.source, self.alias, self.index_name, self.column = source, alias, index_name, column
-        self.bounds = bounds
-
-    @override
-    def __iter__(self) -> Iterator[Row]:
-        lo, hi, lo_inclusive, hi_inclusive = self.bounds
-        for rid in self.source.range(self.column, lo, hi, lo_inclusive=lo_inclusive, hi_inclusive=hi_inclusive):
-            row = self.source.row(rid)
-            yield Row({f"{self.alias}.{c}": row[c] for c in self.source.columns})
-
-    @override
-    def columns(self) -> list[str]:
-        return [f"{self.alias}.{c}" for c in self.source.columns]
-
-    @property
-    @override
-    def label(self) -> str:
-        lo, hi, lo_inclusive, hi_inclusive = self.bounds
-        left = "" if lo is None else f"{lo!r} {'<=' if lo_inclusive else '<'} "
-        right = "" if hi is None else f" {'<=' if hi_inclusive else '<'} {hi!r}"
-        return f"IndexRange {self.source.name} AS {self.alias} using {self.index_name}: {left}{self.column}{right}"
+def _conjunction(exprs: list[Expr]) -> Expr:
+    return exprs[0] if len(exprs) == 1 else And(*exprs)
 
 
 class HashJoin(Operator):
@@ -138,43 +90,92 @@ class HashJoin(Operator):
             for match in buckets.get(key, ()):
                 yield Row(row | match)
 
-    @override
-    def columns(self) -> list[str]:
-        return self.children[0].columns() + self.children[1].columns()
-
     @property
     @override
     def label(self) -> str:
         on = " AND ".join(f"{lk!r} = {rk!r}" for lk, rk in zip(self.left_keys, self.right_keys, strict=True))
         return f"HashJoin (build {self.build}) on {on}"
 
-
-def _buckets(rows: Operator, keys: list[Expr]) -> dict[tuple[Value | None, ...], list[Row]]:
-    """Group ``rows`` by their join key, leaving out keys with NULL: NULL never joins."""
-    buckets: dict[tuple[Value | None, ...], list[Row]] = {}
-    for row in rows:
-        key = tuple(k.eval(row) for k in keys)
-        if not any(v is None for v in key):
-            buckets.setdefault(key, []).append(row)
-    return buckets
+    @override
+    def columns(self) -> list[str]:
+        return self.children[0].columns() + self.children[1].columns()
 
 
-def _conjunction(exprs: list[Expr]) -> Expr:
-    return exprs[0] if len(exprs) == 1 else And(*exprs)
+class IndexLookup(Operator):
+    """Yield the rows whose indexed columns equal ``key``, without a scan.
+
+    :param source: the table or view.
+    :param alias: the qualifier for column names.
+    :param index_name: the index used, for :meth:`explain`.
+    :param key: ``{column: value}`` to look up.
+    """
+
+    def __init__(self, source: PlannedSource, alias: str, index_name: str, key: dict[str, Value | None]) -> None:
+        self.source, self.alias, self.index_name, self.key = source, alias, index_name, key
+
+    @override
+    def __iter__(self) -> Iterator[Row]:
+        for rid in self.source.lookup(self.key):
+            row = self.source.row(rid)
+            yield Row({f"{self.alias}.{c}": row[c] for c in self.source.columns})
+
+    @property
+    @override
+    def label(self) -> str:
+        return f"IndexLookup {self.source.name} AS {self.alias} using {self.index_name} {self.key}"
+
+    @override
+    def columns(self) -> list[str]:
+        return [f"{self.alias}.{c}" for c in self.source.columns]
+
+
+class IndexRange(Operator):
+    """Yield the rows whose ``column`` lies between ``lo`` and ``hi``, through an ordered index.
+
+    :param source: the table or view.
+    :param alias: the qualifier for column names.
+    :param index_name: the index used, for :meth:`explain`.
+    :param column: the indexed column.
+    :param bounds: ``(lo, hi, lo_inclusive, hi_inclusive)``; a ``None``
+        bound is open.
+    """
+
+    def __init__(self, source: PlannedSource, alias: str, index_name: str, column: str, bounds: Bounds) -> None:
+        self.source, self.alias, self.index_name, self.column = source, alias, index_name, column
+        self.bounds = bounds
+
+    @override
+    def __iter__(self) -> Iterator[Row]:
+        lo, hi, lo_inclusive, hi_inclusive = self.bounds
+        for rid in self.source.range(self.column, lo, hi, lo_inclusive=lo_inclusive, hi_inclusive=hi_inclusive):
+            row = self.source.row(rid)
+            yield Row({f"{self.alias}.{c}": row[c] for c in self.source.columns})
+
+    @property
+    @override
+    def label(self) -> str:
+        lo, hi, lo_inclusive, hi_inclusive = self.bounds
+        left = "" if lo is None else f"{lo!r} {'<=' if lo_inclusive else '<'} "
+        right = "" if hi is None else f" {'<=' if hi_inclusive else '<'} {hi!r}"
+        return f"IndexRange {self.source.name} AS {self.alias} using {self.index_name}: {left}{self.column}{right}"
+
+    @override
+    def columns(self) -> list[str]:
+        return [f"{self.alias}.{c}" for c in self.source.columns]
 
 
 # -- the planner -------------------------------------------------------------------------
-class Relation:
-    """Describe one FROM or JOIN item: a source, its alias, and its committed table.
-
-    :param source: the table, or a transaction's view of it.
-    :param alias: the name the query uses for it.
-    """
-
-    def __init__(self, source: PlannedSource, alias: str) -> None:
-        self.source, self.alias = source, alias
-        self.table = source.committed()  # for statistics and indexes
-        self.columns = set(source.columns)
+def _bounds(conditions: list[RangeCondition]) -> Bounds:
+    """Combine range conditions on one column into the tightest lower and upper bounds."""
+    lo: Value | None = None
+    hi: Value | None = None
+    lo_inclusive = hi_inclusive = True
+    for op, value, _ in conditions:
+        if op in (">", ">=") and (lo is None or ordered(value) > ordered(lo) or (value == lo and op == ">")):
+            lo, lo_inclusive = value, op == ">="
+        elif op in ("<", "<=") and (hi is None or ordered(value) < ordered(hi) or (value == hi and op == "<")):
+            hi, hi_inclusive = value, op == "<="
+    return lo, hi, lo_inclusive, hi_inclusive
 
 
 class Planner:
@@ -190,19 +191,6 @@ class Planner:
         self.rels = {r.alias: r for r in rels}
 
     # -- column resolution and statistics ----------------------------------------------------
-    def resolve(self, name: str) -> tuple[str, str] | None:
-        """Find which relation a column belongs to.
-
-        :param name: ``"u.age"`` or ``"age"``.
-        :return: ``(alias, column)``, or ``None`` if the name is unknown or
-            ambiguous.
-        """
-        if "." in name:
-            alias, _, column = name.partition(".")
-            rel = self.rels.get(alias)
-            return (alias, column) if rel and column in rel.columns else None
-        found = [(a, name) for a, r in self.rels.items() if name in r.columns]
-        return found[0] if len(found) == 1 else None
 
     def aliases(self, expr: Expr) -> set[str] | None:
         """Return the relations an expression reads from.
@@ -233,30 +221,49 @@ class Planner:
         index = table.index_on([hit[1]])
         return max(index.distinct_keys(), 1) if index is not None else None
 
-    # -- access paths: how to read one table ---------------------------------------------------
-    def access_path(self, rel: Relation, preds: list[Expr]) -> tuple[Operator, float]:
-        """Choose the cheapest way to read ``rel`` given its own conditions.
+    def resolve(self, name: str) -> tuple[str, str] | None:
+        """Find which relation a column belongs to.
 
-        :param rel: the relation.
-        :param preds: the conditions that mention only ``rel``.
-        :return: the access path, with remaining conditions on top, and the
-            estimated number of rows it produces.
+        :param name: ``"u.age"`` or ``"age"``.
+        :return: ``(alias, column)``, or ``None`` if the name is unknown or
+            ambiguous.
         """
-        preds, eq, ranges = self._canonical(rel, preds)
-        n = len(rel.table)
-        scan = Scan(rel.source, rel.alias)
-        scan.estimate = n
-        candidates: list[Candidate] = [(float(n), scan, [])]
-        for index in rel.table.indexes.values():
-            found = (self._lookup_path(rel, index, eq, n), self._range_path(rel, index, ranges, n))
-            candidates.extend(c for c in found if c is not None)
-        _, op, consumed = min(candidates, key=lambda c: c[0])
-        estimate = n * math.prod(p.selectivity(self) for p in preds)
-        residual = [p for p in preds if not any(p is c for c in consumed)]
-        if residual:
-            op = Filter(op, _conjunction(residual))
-            op.estimate = estimate
-        return op, estimate
+        if "." in name:
+            alias, _, column = name.partition(".")
+            rel = self.rels.get(alias)
+            return (alias, column) if rel and column in rel.columns else None
+        found = [(a, name) for a, r in self.rels.items() if name in r.columns]
+        return found[0] if len(found) == 1 else None
+
+    # -- access paths: how to read one table ---------------------------------------------------
+
+    @staticmethod
+    def _lookup_path(rel: Relation, index: Index, eq: dict[str, tuple[Value, Expr]], n: int) -> Candidate | None:
+        if not set(index.columns) <= eq.keys():
+            return None
+        matches = n / max(index.distinct_keys(), 1)
+        op = IndexLookup(rel.source, rel.alias, index.name, {c: eq[c][0] for c in index.columns})
+        op.estimate = matches
+        return (1 + matches, op, [eq[c][1] for c in index.columns])
+
+    @staticmethod
+    def _prepared(rel: Relation, column: str, value: Value) -> Value | None:
+        """Normalize ``value`` for ``column``, or return ``None`` if it isn't valid there."""
+        try:
+            return rel.source.schema.column(column).prepare(value)
+        except DatabaseError:
+            return None  # not a valid value: compare it as written
+
+    @staticmethod
+    def _range_path(rel: Relation, index: Index, ranges: dict[str, list[RangeCondition]], n: int) -> Candidate | None:
+        if index.kind == "hash" or len(index.columns) != 1 or index.columns[0] not in ranges:
+            return None
+        column = index.columns[0]
+        bounds = _bounds(ranges[column])
+        matches = n * (1 / 3) ** ((bounds[0] is not None) + (bounds[1] is not None))
+        op = IndexRange(rel.source, rel.alias, index.name, column, bounds)
+        op.estimate = matches
+        return (1 + matches, op, [p for _, _, p in ranges[column]])
 
     def _canonical(
         self, rel: Relation, preds: list[Expr]
@@ -294,69 +301,42 @@ class Planner:
             return None
         return Compare(c.op, c.left, Const(value)), hit[1], value
 
-    @staticmethod
-    def _prepared(rel: Relation, column: str, value: Value) -> Value | None:
-        """Normalize ``value`` for ``column``, or return ``None`` if it isn't valid there."""
-        try:
-            return rel.source.schema.column(column).prepare(value)
-        except DatabaseError:
-            return None  # not a valid value: compare it as written
+    def access_path(self, rel: Relation, preds: list[Expr]) -> tuple[Operator, float]:
+        """Choose the cheapest way to read ``rel`` given its own conditions.
 
-    @staticmethod
-    def _lookup_path(rel: Relation, index: Index, eq: dict[str, tuple[Value, Expr]], n: int) -> Candidate | None:
-        if not set(index.columns) <= eq.keys():
-            return None
-        matches = n / max(index.distinct_keys(), 1)
-        op = IndexLookup(rel.source, rel.alias, index.name, {c: eq[c][0] for c in index.columns})
-        op.estimate = matches
-        return (1 + matches, op, [eq[c][1] for c in index.columns])
-
-    @staticmethod
-    def _range_path(rel: Relation, index: Index, ranges: dict[str, list[RangeCondition]], n: int) -> Candidate | None:
-        if index.kind == "hash" or len(index.columns) != 1 or index.columns[0] not in ranges:
-            return None
-        column = index.columns[0]
-        bounds = _bounds(ranges[column])
-        matches = n * (1 / 3) ** ((bounds[0] is not None) + (bounds[1] is not None))
-        op = IndexRange(rel.source, rel.alias, index.name, column, bounds)
-        op.estimate = matches
-        return (1 + matches, op, [p for _, _, p in ranges[column]])
+        :param rel: the relation.
+        :param preds: the conditions that mention only ``rel``.
+        :return: the access path, with remaining conditions on top, and the
+            estimated number of rows it produces.
+        """
+        preds, eq, ranges = self._canonical(rel, preds)
+        n = len(rel.table)
+        scan = Scan(rel.source, rel.alias)
+        scan.estimate = n
+        candidates: list[Candidate] = [(float(n), scan, [])]
+        for index in rel.table.indexes.values():
+            found = (self._lookup_path(rel, index, eq, n), self._range_path(rel, index, ranges, n))
+            candidates.extend(c for c in found if c is not None)
+        _, op, consumed = min(candidates, key=lambda c: c[0])
+        estimate = n * math.prod(p.selectivity(self) for p in preds)
+        residual = [p for p in preds if not any(p is c for c in consumed)]
+        if residual:
+            op = Filter(op, _conjunction(residual))
+            op.estimate = estimate
+        return op, estimate
 
     # -- join ordering: greedy, smallest intermediate result first ------------------------------
-    def join(self, paths: dict[str, tuple[Operator, float]], multi: list[tuple[Expr, set[str]]]) -> Operator:
-        """Join the access paths, always adding the relation that gives the smallest result.
 
-        :param paths: the access path and estimate of each relation.
-        :param multi: conditions that mention several relations, with their aliases.
-        :return: the joined plan.
-        """
-        remaining = dict(paths)
-        start = min(remaining, key=lambda a: remaining[a][1])
-        op, est = remaining.pop(start)
-        joined, pending = {start}, list(multi)
-        while remaining:
-            scores = {a: self._score(a, joined, est, remaining[a][1], pending) for a in remaining}
-            alias = min(scores, key=scores.__getitem__)
-            right, right_est = remaining.pop(alias)
-            usable = [e for e, al in pending if alias in al and al <= joined | {alias}]
-            pending = [(e, al) for e, al in pending if not any(e is u for u in usable)]
-            op = self._join_op(
-                op, left_est=est, right=right, right_est=right_est, alias=alias, joined=joined, usable=usable
-            )
-            est = scores[alias][1]
-            op.estimate = est
-            joined.add(alias)
-        for e, _ in pending:
-            op = Filter(op, e)
-        return op
-
-    def _score(
-        self, alias: str, joined: set[str], est: float, right_est: float, pending: list[tuple[Expr, set[str]]]
-    ) -> tuple[bool, float]:
-        """Rate joining ``alias`` next: connected joins first, then the smallest estimate."""
-        usable = [e for e, al in pending if alias in al and al <= joined | {alias}]
-        size = est * right_est * math.prod(e.selectivity(self) for e in usable)
-        return (not usable, size)
+    def _equi_sides(self, e: Expr, alias: str, joined: set[str]) -> tuple[Col, Col] | None:
+        """Return ``(joined side, new side)`` if ``e`` equates a column of each."""
+        if not (isinstance(e, Compare) and e.op == "=" and isinstance(e.left, Col) and isinstance(e.right, Col)):
+            return None
+        lhs, rhs = self.resolve(e.left.name), self.resolve(e.right.name)
+        if lhs is None or rhs is None:
+            return None
+        if rhs[0] == alias and lhs[0] in joined:
+            return e.left, e.right
+        return (e.right, e.left) if lhs[0] == alias and rhs[0] in joined else None
 
     def _join_op(
         self,
@@ -385,31 +365,42 @@ class Planner:
         op: Operator = HashJoin(left, right, left_keys, right_keys, "right" if right_est <= left_est else "left")
         return Filter(op, _conjunction(others)) if others else op
 
-    def _equi_sides(self, e: Expr, alias: str, joined: set[str]) -> tuple[Col, Col] | None:
-        """Return ``(joined side, new side)`` if ``e`` equates a column of each."""
-        if not (isinstance(e, Compare) and e.op == "=" and isinstance(e.left, Col) and isinstance(e.right, Col)):
-            return None
-        lhs, rhs = self.resolve(e.left.name), self.resolve(e.right.name)
-        if lhs is None or rhs is None:
-            return None
-        if rhs[0] == alias and lhs[0] in joined:
-            return e.left, e.right
-        return (e.right, e.left) if lhs[0] == alias and rhs[0] in joined else None
+    def _score(
+        self, alias: str, joined: set[str], est: float, right_est: float, pending: list[tuple[Expr, set[str]]]
+    ) -> tuple[bool, float]:
+        """Rate joining ``alias`` next: connected joins first, then the smallest estimate."""
+        usable = [e for e, al in pending if alias in al and al <= joined | {alias}]
+        size = est * right_est * math.prod(e.selectivity(self) for e in usable)
+        return (not usable, size)
+
+    def join(self, paths: dict[str, tuple[Operator, float]], multi: list[tuple[Expr, set[str]]]) -> Operator:
+        """Join the access paths, always adding the relation that gives the smallest result.
+
+        :param paths: the access path and estimate of each relation.
+        :param multi: conditions that mention several relations, with their aliases.
+        :return: the joined plan.
+        """
+        remaining = dict(paths)
+        start = min(remaining, key=lambda a: remaining[a][1])
+        op, est = remaining.pop(start)
+        joined, pending = {start}, list(multi)
+        while remaining:
+            scores = {a: self._score(a, joined, est, remaining[a][1], pending) for a in remaining}
+            alias = min(scores, key=scores.__getitem__)
+            right, right_est = remaining.pop(alias)
+            usable = [e for e, al in pending if alias in al and al <= joined | {alias}]
+            pending = [(e, al) for e, al in pending if not any(e is u for u in usable)]
+            op = self._join_op(
+                op, left_est=est, right=right, right_est=right_est, alias=alias, joined=joined, usable=usable
+            )
+            est = scores[alias][1]
+            op.estimate = est
+            joined.add(alias)
+        for e, _ in pending:
+            op = Filter(op, e)
+        return op
 
     # -- putting it together -----------------------------------------------------------------
-    def plan(self) -> Operator:
-        """Build the physical plan for the query.
-
-        :return: the root operator.
-        """
-        if any(kind != "inner" for _, _, _, kind in self.q.joins):
-            return self.q.plan_naive()  # outer joins: keep the written order
-        local, multi, opaque = self._classify()
-        paths = {a: self.access_path(self.rels[a], local[a]) for a in self.rels}
-        op = self.join(paths, multi)
-        for predicate in opaque:
-            op = Filter(op, predicate)
-        return self.q.finish_plan(op)
 
     def _classify(self) -> tuple[dict[str, list[Expr]], list[tuple[Expr, set[str]]], list[RowPredicate]]:
         """Split every condition into conjuncts, and sort them by the relations they mention."""
@@ -437,15 +428,29 @@ class Planner:
         else:
             multi.append((part, aliases))
 
+    def plan(self) -> Operator:
+        """Build the physical plan for the query.
 
-def _bounds(conditions: list[RangeCondition]) -> Bounds:
-    """Combine range conditions on one column into the tightest lower and upper bounds."""
-    lo: Value | None = None
-    hi: Value | None = None
-    lo_inclusive = hi_inclusive = True
-    for op, value, _ in conditions:
-        if op in (">", ">=") and (lo is None or ordered(value) > ordered(lo) or (value == lo and op == ">")):
-            lo, lo_inclusive = value, op == ">="
-        elif op in ("<", "<=") and (hi is None or ordered(value) < ordered(hi) or (value == hi and op == "<")):
-            hi, hi_inclusive = value, op == "<="
-    return lo, hi, lo_inclusive, hi_inclusive
+        :return: the root operator.
+        """
+        if any(kind != "inner" for _, _, _, kind in self.q.joins):
+            return self.q.plan_naive()  # outer joins: keep the written order
+        local, multi, opaque = self._classify()
+        paths = {a: self.access_path(self.rels[a], local[a]) for a in self.rels}
+        op = self.join(paths, multi)
+        for predicate in opaque:
+            op = Filter(op, predicate)
+        return self.q.finish_plan(op)
+
+
+class Relation:
+    """Describe one FROM or JOIN item: a source, its alias, and its committed table.
+
+    :param source: the table, or a transaction's view of it.
+    :param alias: the name the query uses for it.
+    """
+
+    def __init__(self, source: PlannedSource, alias: str) -> None:
+        self.source, self.alias = source, alias
+        self.table = source.committed()  # for statistics and indexes
+        self.columns = set(source.columns)

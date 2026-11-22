@@ -1,20 +1,41 @@
 [project]
-name = "minidb"
+name = "mini-db"
 version = "0.1.0"
-description = "A small relational database, built in the book"
+description = "A small relational database in pure Python, built one subsystem at a time in an accompanying book"
 readme = "README.md"
 authors = [
     { name = "Stefano Bragaglia", email = "stefano-bragaglia@users.noreply.github.com" }
 ]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = []
+keywords = ["database", "relational", "sql", "b-tree", "transactions", "education", "learning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Education",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Database",
+    "Topic :: Education",
+    "Typing :: Typed",
+]
 
-[project.scripts]
-minidb = "minidb:main"
+[project.urls]
+Homepage = "https://github.com/stefano-bragaglia/mini-db-book"
+Documentation = "https://github.com/stefano-bragaglia/mini-db-book/blob/main/docs/minidb-book/index.md"
+Source = "https://github.com/stefano-bragaglia/mini-db-book"
+Issues = "https://github.com/stefano-bragaglia/mini-db-book/issues"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "minidb"  # the distribution is "mini-db"; the import name stays "minidb"
 
 # ---------------------------------------------------------------------------
 # Ruff — linter + formatter

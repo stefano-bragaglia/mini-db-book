@@ -15,29 +15,6 @@ from minidb import Sum
 from minidb.locks import RWLockBase
 
 
-class MutexAsRWLock(RWLockBase):
-    """Behave like Chapter 10's lock: every acquisition is exclusive."""
-
-    def __init__(self) -> None:
-        self._mutex = threading.Lock()
-
-    def acquire_read(self) -> None:
-        """Take the mutex."""
-        self._mutex.acquire()
-
-    def release_read(self) -> None:
-        """Release the mutex."""
-        self._mutex.release()
-
-    def acquire_write(self) -> None:
-        """Take the mutex."""
-        self._mutex.acquire()
-
-    def release_write(self) -> None:
-        """Release the mutex."""
-        self._mutex.release()
-
-
 def filled(db: Database) -> Database:
     """Create and fill the test table in ``db``.
 
@@ -71,6 +48,29 @@ def run(db: Database, threads: int = 4, queries: int = 20) -> float:
     for t in ts:
         t.join()
     return time.perf_counter() - t0
+
+
+class MutexAsRWLock(RWLockBase):
+    """Behave like Chapter 10's lock: every acquisition is exclusive."""
+
+    def __init__(self) -> None:
+        self._mutex = threading.Lock()
+
+    def acquire_read(self) -> None:
+        """Take the mutex."""
+        self._mutex.acquire()
+
+    def acquire_write(self) -> None:
+        """Take the mutex."""
+        self._mutex.acquire()
+
+    def release_read(self) -> None:
+        """Release the mutex."""
+        self._mutex.release()
+
+    def release_write(self) -> None:
+        """Release the mutex."""
+        self._mutex.release()
 
 
 def main() -> None:

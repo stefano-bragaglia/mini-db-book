@@ -16,30 +16,6 @@ from minidb.locks import WriterPreferringLock
 DURATION, HOLD = 1.0, 0.01
 
 
-def reader_stream(lock: RWLockBase, stop: threading.Event, offset: float) -> None:
-    """Hold the lock for reading, again and again, until ``stop`` is set.
-
-    :param lock: the lock under test.
-    :param stop: set when the experiment is over.
-    :param offset: how long to wait before starting, to stagger readers.
-    """
-    time.sleep(offset)
-    while not stop.is_set():
-        with lock.read():
-            time.sleep(HOLD)
-
-
-def writer_stream(lock: RWLockBase, stop: threading.Event) -> None:
-    """Hold the lock for writing, briefly, again and again, until ``stop`` is set.
-
-    :param lock: the lock under test.
-    :param stop: set when the experiment is over.
-    """
-    while not stop.is_set():
-        with lock.write():
-            time.sleep(HOLD / 10)
-
-
 def probe(lock: RWLockBase, kind: str, waited: dict[str, float]) -> None:
     """Arrive late, and record how long it takes to get the lock.
 
@@ -51,6 +27,19 @@ def probe(lock: RWLockBase, kind: str, waited: dict[str, float]) -> None:
     t0 = time.perf_counter()
     with lock.read() if kind == "reader" else lock.write():
         waited[kind] = time.perf_counter() - t0
+
+
+def reader_stream(lock: RWLockBase, stop: threading.Event, offset: float) -> None:
+    """Hold the lock for reading, again and again, until ``stop`` is set.
+
+    :param lock: the lock under test.
+    :param stop: set when the experiment is over.
+    :param offset: how long to wait before starting, to stagger readers.
+    """
+    time.sleep(offset)
+    while not stop.is_set():
+        with lock.read():
+            time.sleep(HOLD)
 
 
 def starvation_test(lock: RWLockBase) -> dict[str, float]:
@@ -70,6 +59,17 @@ def starvation_test(lock: RWLockBase) -> dict[str, float]:
     for t in threads:
         t.join()
     return waited
+
+
+def writer_stream(lock: RWLockBase, stop: threading.Event) -> None:
+    """Hold the lock for writing, briefly, again and again, until ``stop`` is set.
+
+    :param lock: the lock under test.
+    :param stop: set when the experiment is over.
+    """
+    while not stop.is_set():
+        with lock.write():
+            time.sleep(HOLD / 10)
 
 
 def main() -> None:

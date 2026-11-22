@@ -9,21 +9,35 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-type Row = dict[str, object]
 type Relation = list[Row]
 
+type Row = dict[str, object]
 
-def select(relation: Relation, predicate: Callable[[Row], bool]) -> Relation:
-    """Keep the rows of ``relation`` for which ``predicate`` is true (*selection*).
+ORDERS: Relation = [
+    {"order_id": 10, "user_id": 1, "total": 25},
+    {"order_id": 11, "user_id": 2, "total": 40},
+    {"order_id": 12, "user_id": 1, "total": 15},
+]
 
-    >>> select([{"a": 1}, {"a": 2}], lambda row: row["a"] == 2)
-    [{'a': 2}]
+USERS: Relation = [
+    {"id": 1, "name": "Ada", "age": 36},
+    {"id": 2, "name": "Alan", "age": 41},
+    {"id": 3, "name": "Grace", "age": None},
+]
 
-    :param relation: the input relation.
-    :param predicate: decides whether a row is kept.
-    :return: the kept rows, in input order.
+
+def join(left: Relation, right: Relation, on: Callable[[Row, Row], bool]) -> Relation:
+    """Combine every pair of rows from ``left`` and ``right`` that matches (*join*).
+
+    >>> join([{"a": 1}], [{"b": 1}, {"b": 2}], lambda x, y: x["a"] == y["b"])
+    [{'a': 1, 'b': 1}]
+
+    :param left: the outer relation.
+    :param right: the inner relation.
+    :param on: decides whether a pair of rows matches.
+    :return: the merged pairs, ordered by ``left`` and then by ``right``.
     """
-    return [row for row in relation if predicate(row)]
+    return [lrow | rrow for lrow in left for rrow in right if on(lrow, rrow)]
 
 
 def project(relation: Relation, *attributes: str) -> Relation:
@@ -51,27 +65,14 @@ def project(relation: Relation, *attributes: str) -> Relation:
     return out
 
 
-def join(left: Relation, right: Relation, on: Callable[[Row, Row], bool]) -> Relation:
-    """Combine every pair of rows from ``left`` and ``right`` that matches (*join*).
+def select(relation: Relation, predicate: Callable[[Row], bool]) -> Relation:
+    """Keep the rows of ``relation`` for which ``predicate`` is true (*selection*).
 
-    >>> join([{"a": 1}], [{"b": 1}, {"b": 2}], lambda x, y: x["a"] == y["b"])
-    [{'a': 1, 'b': 1}]
+    >>> select([{"a": 1}, {"a": 2}], lambda row: row["a"] == 2)
+    [{'a': 2}]
 
-    :param left: the outer relation.
-    :param right: the inner relation.
-    :param on: decides whether a pair of rows matches.
-    :return: the merged pairs, ordered by ``left`` and then by ``right``.
+    :param relation: the input relation.
+    :param predicate: decides whether a row is kept.
+    :return: the kept rows, in input order.
     """
-    return [lrow | rrow for lrow in left for rrow in right if on(lrow, rrow)]
-
-
-USERS: Relation = [
-    {"id": 1, "name": "Ada", "age": 36},
-    {"id": 2, "name": "Alan", "age": 41},
-    {"id": 3, "name": "Grace", "age": None},
-]
-ORDERS: Relation = [
-    {"order_id": 10, "user_id": 1, "total": 25},
-    {"order_id": 11, "user_id": 2, "total": 40},
-    {"order_id": 12, "user_id": 1, "total": 15},
-]
+    return [row for row in relation if predicate(row)]

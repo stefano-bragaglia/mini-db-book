@@ -17,9 +17,37 @@ from minidb.values import Value
 if TYPE_CHECKING:
     from minidb.values import Primitive
 
+_FALSE = frozenset({"false", "f", "no", "n", "off", "0"})
+
 _INT_RE = re.compile(r"[+-]?\d+")
 _TRUE = frozenset({"true", "t", "yes", "y", "on", "1"})
-_FALSE = frozenset({"false", "f", "no", "n", "off", "0"})
+
+
+def _integral(value: object) -> int | None:
+    """Return ``value`` as an int if it is a whole float or Decimal, or a numeric string."""
+    match value:
+        case float() if value.is_integer():
+            return int(value)
+        case Decimal() if value.is_finite() and value == value.to_integral_value():
+            return int(value)
+        case str() if _INT_RE.fullmatch(value.strip()):
+            return int(value.strip())
+        case _:
+            return None
+
+
+def _to_decimal(value: object) -> Decimal | None:
+    """Return ``value`` as a Decimal, or ``None`` if it isn't a number."""
+    if isinstance(value, float):
+        return Decimal(repr(value))  # 0.1 -> Decimal('0.1'), not its binary value
+    if isinstance(value, int | Decimal) and not isinstance(value, bool):
+        return Decimal(value)
+    if isinstance(value, str):
+        try:
+            return Decimal(value.strip())
+        except InvalidOperation:
+            return None
+    return None
 
 
 class Type[T: Value]:
@@ -36,6 +64,35 @@ class Type[T: Value]:
 
     exact_types: ClassVar[tuple[type, ...]] = ()
 
+    def coerce(self, value: object) -> T:
+        """Convert a non-NULL ``value``; subclasses override this.
+
+        :param value: the input, never ``None``.
+        :return: the canonical value.
+        :raises DomainError: always, in the base class.
+        """
+        raise self.error(value)
+
+    def error(self, value: object, reason: str = "") -> DomainError:
+        """Build the error that rejects ``value``.
+
+        :param value: the rejected value.
+        :param reason: why it was rejected; empty by default.
+        :return: an exception for the caller to raise.
+        """
+        return DomainError(f"{value!r} is not a valid {self!r}" + (f": {reason}" if reason else ""))
+
+    def from_primitive(self, value: Primitive) -> T | None:
+        """Convert a stored primitive back into a canonical value, and validate it.
+
+        :param value: what :meth:`to_primitive` produced.
+        :return: the canonical value, or ``None``.
+        :raises DomainError: if the stored value is not valid for this type.
+        """
+        result = self.normalize(value)
+        self.validate(result)
+        return result
+
     def normalize(self, value: object) -> T | None:
         """Convert ``value`` to this type's canonical form.
 
@@ -45,14 +102,13 @@ class Type[T: Value]:
         """
         return None if value is None else self.coerce(value)
 
-    def coerce(self, value: object) -> T:
-        """Convert a non-NULL ``value``; subclasses override this.
+    def to_primitive(self, value: Value | None) -> Primitive:
+        """Convert a canonical value into something any :class:`Format` can store.
 
-        :param value: the input, never ``None``.
-        :return: the canonical value.
-        :raises DomainError: always, in the base class.
+        :param value: a value of this type, or ``None``.
+        :return: the value itself, in the base class.
         """
-        raise self.error(value)
+        return value if not isinstance(value, Decimal | dt.date) else str(value)
 
     def validate(self, value: object) -> None:
         """Check that ``value`` is canonical and inside the domain.
@@ -66,112 +122,52 @@ class Type[T: Value]:
         if value is not None and type(value) not in self.exact_types:
             raise self.error(value)
 
-    def error(self, value: object, reason: str = "") -> DomainError:
-        """Build the error that rejects ``value``.
-
-        :param value: the rejected value.
-        :param reason: why it was rejected; empty by default.
-        :return: an exception for the caller to raise.
-        """
-        return DomainError(f"{value!r} is not a valid {self!r}" + (f": {reason}" if reason else ""))
-
-    def to_primitive(self, value: Value | None) -> Primitive:
-        """Convert a canonical value into something any :class:`Format` can store.
-
-        :param value: a value of this type, or ``None``.
-        :return: the value itself, in the base class.
-        """
-        return value if not isinstance(value, Decimal | dt.date) else str(value)
-
-    def from_primitive(self, value: Primitive) -> T | None:
-        """Convert a stored primitive back into a canonical value, and validate it.
-
-        :param value: what :meth:`to_primitive` produced.
-        :return: the canonical value, or ``None``.
-        :raises DomainError: if the stored value is not valid for this type.
-        """
-        result = self.normalize(value)
-        self.validate(result)
-        return result
-
-
-def _integral(value: object) -> int | None:
-    """Return ``value`` as an int if it is a whole float or Decimal, or a numeric string."""
-    match value:
-        case float() if value.is_integer():
-            return int(value)
-        case Decimal() if value.is_finite() and value == value.to_integral_value():
-            return int(value)
-        case str() if _INT_RE.fullmatch(value.strip()):
-            return int(value.strip())
-        case _:
-            return None
-
 
 @dataclass(frozen=True)
-class Integer(Type[int]):
-    """Hold whole numbers, optionally between ``min`` and ``max``.
+class Timestamp(Type[dt.datetime]):
+    """Hold points in time: all timezone-aware (stored in UTC), or all naive.
 
-    >>> Integer(min=0).normalize(" 42 ")
-    42
+    Python refuses to compare aware and naive datetimes, so a column must
+    pick one kind.
 
-    :param min: the smallest valid value; ``None`` (the default) for no limit.
-    :param max: the largest valid value; ``None`` (the default) for no limit.
+    >>> Timestamp().normalize("2026-11-18T10:00:00+01:00")
+    datetime.datetime(2026, 11, 18, 9, 0, tzinfo=datetime.timezone.utc)
+
+    :param with_timezone: whether values must be aware; ``True`` by default.
     """
 
-    min: int | None = None
-    max: int | None = None
-    exact_types: ClassVar[tuple[type, ...]] = (int,)
+    with_timezone: bool = True
+    exact_types: ClassVar[tuple[type, ...]] = (dt.datetime,)
 
-    @override
-    def coerce(self, value: object) -> int:
-        if isinstance(value, bool):
-            raise self.error(value, "booleans are not integers")
-        if isinstance(value, int):
+    def _parse(self, value: object) -> dt.datetime:
+        if isinstance(value, dt.datetime):
             return value
-        number = _integral(value)
-        if number is None:
-            raise self.error(value)
-        return number
-
-    @override
-    def validate(self, value: object) -> None:
-        super().validate(value)
-        if isinstance(value, int):
-            if self.min is not None and value < self.min:
-                raise self.error(value, f"below minimum {self.min}")
-            if self.max is not None and value > self.max:
-                raise self.error(value, f"above maximum {self.max}")
-
-
-@dataclass(frozen=True)
-class Real(Type[float]):
-    """Hold finite floating-point numbers; NaN and infinities are rejected.
-
-    >>> Real().normalize("2.5")
-    2.5
-    """
-
-    exact_types: ClassVar[tuple[type, ...]] = (float,)
-
-    @override
-    def coerce(self, value: object) -> float:
-        if isinstance(value, bool):
-            raise self.error(value, "booleans are not numbers")
-        if isinstance(value, int | float | Decimal):
-            return float(value)
         if isinstance(value, str):
             try:
-                return float(value.strip())
+                return dt.datetime.fromisoformat(value.strip())
             except ValueError:
                 raise self.error(value) from None
         raise self.error(value)
 
     @override
+    def coerce(self, value: object) -> dt.datetime:
+        stamp = self._parse(value)
+        aware = stamp.utcoffset() is not None
+        if self.with_timezone and not aware:
+            raise self.error(value, "a timezone is required")
+        if not self.with_timezone and aware:
+            raise self.error(value, "timezone not allowed")
+        return stamp.astimezone(dt.UTC) if aware else stamp
+
+    @override
+    def to_primitive(self, value: Value | None) -> Primitive:
+        return value.isoformat() if isinstance(value, dt.datetime) else None
+
+    @override
     def validate(self, value: object) -> None:
         super().validate(value)
-        if isinstance(value, float) and not math.isfinite(value):
-            raise self.error(value, "NaN and infinities are not allowed")
+        if isinstance(value, dt.datetime) and self.with_timezone and value.utcoffset() != dt.timedelta(0):
+            raise self.error(value, "must be stored in UTC")
 
 
 @dataclass(frozen=True)
@@ -203,39 +199,33 @@ class Text(Type[str]):
 
 
 @dataclass(frozen=True)
-class Boolean(Type[bool]):
-    """Hold ``True`` or ``False``, accepting 0/1 and words such as "yes" and "off".
+class Real(Type[float]):
+    """Hold finite floating-point numbers; NaN and infinities are rejected.
 
-    >>> Boolean().normalize("Yes"), Boolean().normalize(0)
-    (True, False)
+    >>> Real().normalize("2.5")
+    2.5
     """
 
-    exact_types: ClassVar[tuple[type, ...]] = (bool,)
+    exact_types: ClassVar[tuple[type, ...]] = (float,)
 
     @override
-    def coerce(self, value: object) -> bool:
+    def coerce(self, value: object) -> float:
         if isinstance(value, bool):
-            return value
-        if value in (0, 1):
-            return value == 1
-        word = value.strip().lower() if isinstance(value, str) else None
-        if word in _TRUE or word in _FALSE:
-            return word in _TRUE
+            raise self.error(value, "booleans are not numbers")
+        if isinstance(value, int | float | Decimal):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value.strip())
+            except ValueError:
+                raise self.error(value) from None
         raise self.error(value)
 
-
-def _to_decimal(value: object) -> Decimal | None:
-    """Return ``value`` as a Decimal, or ``None`` if it isn't a number."""
-    if isinstance(value, float):
-        return Decimal(repr(value))  # 0.1 -> Decimal('0.1'), not its binary value
-    if isinstance(value, int | Decimal) and not isinstance(value, bool):
-        return Decimal(value)
-    if isinstance(value, str):
-        try:
-            return Decimal(value.strip())
-        except InvalidOperation:
-            return None
-    return None
+    @override
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, float) and not math.isfinite(value):
+            raise self.error(value, "NaN and infinities are not allowed")
 
 
 @dataclass(frozen=True)
@@ -281,6 +271,42 @@ class Numeric(Type[Decimal]):
 
 
 @dataclass(frozen=True)
+class Integer(Type[int]):
+    """Hold whole numbers, optionally between ``min`` and ``max``.
+
+    >>> Integer(min=0).normalize(" 42 ")
+    42
+
+    :param min: the smallest valid value; ``None`` (the default) for no limit.
+    :param max: the largest valid value; ``None`` (the default) for no limit.
+    """
+
+    min: int | None = None
+    max: int | None = None
+    exact_types: ClassVar[tuple[type, ...]] = (int,)
+
+    @override
+    def coerce(self, value: object) -> int:
+        if isinstance(value, bool):
+            raise self.error(value, "booleans are not integers")
+        if isinstance(value, int):
+            return value
+        number = _integral(value)
+        if number is None:
+            raise self.error(value)
+        return number
+
+    @override
+    def validate(self, value: object) -> None:
+        super().validate(value)
+        if isinstance(value, int):
+            if self.min is not None and value < self.min:
+                raise self.error(value, f"below minimum {self.min}")
+            if self.max is not None and value > self.max:
+                raise self.error(value, f"above maximum {self.max}")
+
+
+@dataclass(frozen=True)
 class Date(Type[dt.date]):
     """Hold calendar dates, accepting ISO strings such as ``"2026-11-18"``.
 
@@ -305,47 +331,22 @@ class Date(Type[dt.date]):
 
 
 @dataclass(frozen=True)
-class Timestamp(Type[dt.datetime]):
-    """Hold points in time: all timezone-aware (stored in UTC), or all naive.
+class Boolean(Type[bool]):
+    """Hold ``True`` or ``False``, accepting 0/1 and words such as "yes" and "off".
 
-    Python refuses to compare aware and naive datetimes, so a column must
-    pick one kind.
-
-    >>> Timestamp().normalize("2026-11-18T10:00:00+01:00")
-    datetime.datetime(2026, 11, 18, 9, 0, tzinfo=datetime.timezone.utc)
-
-    :param with_timezone: whether values must be aware; ``True`` by default.
+    >>> Boolean().normalize("Yes"), Boolean().normalize(0)
+    (True, False)
     """
 
-    with_timezone: bool = True
-    exact_types: ClassVar[tuple[type, ...]] = (dt.datetime,)
+    exact_types: ClassVar[tuple[type, ...]] = (bool,)
 
     @override
-    def coerce(self, value: object) -> dt.datetime:
-        stamp = self._parse(value)
-        aware = stamp.utcoffset() is not None
-        if self.with_timezone and not aware:
-            raise self.error(value, "a timezone is required")
-        if not self.with_timezone and aware:
-            raise self.error(value, "timezone not allowed")
-        return stamp.astimezone(dt.UTC) if aware else stamp
-
-    def _parse(self, value: object) -> dt.datetime:
-        if isinstance(value, dt.datetime):
+    def coerce(self, value: object) -> bool:
+        if isinstance(value, bool):
             return value
-        if isinstance(value, str):
-            try:
-                return dt.datetime.fromisoformat(value.strip())
-            except ValueError:
-                raise self.error(value) from None
+        if value in (0, 1):
+            return value == 1
+        word = value.strip().lower() if isinstance(value, str) else None
+        if word in _TRUE or word in _FALSE:
+            return word in _TRUE
         raise self.error(value)
-
-    @override
-    def validate(self, value: object) -> None:
-        super().validate(value)
-        if isinstance(value, dt.datetime) and self.with_timezone and value.utcoffset() != dt.timedelta(0):
-            raise self.error(value, "must be stored in UTC")
-
-    @override
-    def to_primitive(self, value: Value | None) -> Primitive:
-        return value.isoformat() if isinstance(value, dt.datetime) else None

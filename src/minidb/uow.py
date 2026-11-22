@@ -31,11 +31,47 @@ if TYPE_CHECKING:
     from minidb.values import Row
     from minidb.values import Value
 
+type RangeRead = tuple[str, Value | None, Value | None, bool, bool]  # column, lo, hi, inclusive?
+
 type ReadKey = tuple[str, tuple[tuple[str, Value | None], ...]]  # ("lookup" | "match", frozen key)
 
+_MISSING = object()
 
-class TransactionError(DatabaseError):
-    """Signal that a unit of work was used in the wrong state, e.g. after commit."""
+
+def _equal(row: Mapping[str, Value | None], key: Mapping[str, Value | None]) -> bool:
+    """Compare like SQL on every column of ``key``: NULL never equals anything."""
+    return all(v is not None and row[c] == v for c, v in key.items())
+
+
+def _freeze(key: Mapping[str, Value | None]) -> tuple[tuple[str, Value | None], ...]:
+    return tuple(sorted(key.items(), key=lambda kv: kv[0]))
+
+
+def _in_range(value: Value | None, bounds: RangeRead) -> bool:
+    """Tell whether ``value`` lies within ``bounds``; NULL never does."""
+    _, lo, hi, lo_inclusive, hi_inclusive = bounds
+    if value is None:
+        return False
+    v = ordered(value)
+    if lo is not None and (v < ordered(lo) or (value == lo and not lo_inclusive)):
+        return False
+    return not (hi is not None and (v > ordered(hi) or (value == hi and not hi_inclusive)))
+
+
+class Record(dict[str, "Value | None"]):
+    """Hold a row loaded through a unit of work; mutate it, and commit saves it.
+
+    :param table: the table the row is in.
+    :param rowid: the row's rowid.
+    :param row: its current values.
+    """
+
+    def __init__(self, table: str, rowid: int, row: Row) -> None:
+        super().__init__(row)
+        self.table, self.rowid = table, rowid
+
+    def __repr__(self) -> str:
+        return f"Record({self.table}#{self.rowid}, {dict.__repr__(self)})"
 
 
 class TableView:
@@ -60,11 +96,12 @@ class TableView:
         self.range_reads: dict[RangeRead, frozenset[int]] = {}  # range read -> rowids seen
 
     # -- reads of committed data, latched and recorded ----------------------------------
-    def _base_row(self, rowid: int) -> Row | None:
+
+    def _base_equal(self, kind: str, key: Mapping[str, Value | None]) -> set[int]:
         with self.uow.latch():
-            row = self.base.rows.get(rowid)
-            self.row_reads.setdefault(rowid, self.base.row_versions.get(rowid))
-        return row
+            found = self.base.lookup(key) if kind == "lookup" else set(self.base.match(key))
+        self.key_reads.setdefault((kind, _freeze(key)), frozenset(found))
+        return found
 
     def _base_items(self) -> list[tuple[int, Row]]:
         with self.uow.latch():
@@ -73,24 +110,16 @@ class TableView:
                 self.scanned_version = self.base.version
         return items
 
-    def _base_equal(self, kind: str, key: Mapping[str, Value | None]) -> set[int]:
+    def _base_row(self, rowid: int) -> Row | None:
         with self.uow.latch():
-            found = self.base.lookup(key) if kind == "lookup" else set(self.base.match(key))
-        self.key_reads.setdefault((kind, _freeze(key)), frozenset(found))
-        return found
+            row = self.base.rows.get(rowid)
+            self.row_reads.setdefault(rowid, self.base.row_versions.get(rowid))
+        return row
 
     # -- the interface used by planners and queries ------------------------------------
-    def row(self, rowid: int) -> Row:
-        """Return the row as this transaction sees it.
 
-        :param rowid: the row to fetch.
-        :return: the row; callers must never mutate it.
-        :raises KeyError: if the row doesn't exist here.
-        """
-        row = self.overlay[rowid] if rowid in self.overlay else self._base_row(rowid)
-        if row is None:
-            raise KeyError(rowid)
-        return row
+    def __len__(self) -> int:
+        return sum(1 for _ in self.scan())
 
     def get(self, rowid: int) -> Row | None:
         """Return a copy of the row, or ``None`` if it doesn't exist here.
@@ -102,6 +131,49 @@ class TableView:
             return dict(self.row(rowid))
         except KeyError:
             return None
+
+    def lookup(self, key: Mapping[str, Value | None]) -> set[int]:
+        """Return the rowids whose columns equal ``key``, as the index would.
+
+        :param key: ``{column: value}``.
+        :return: the matching rowids.
+        :raises SchemaError: if no index covers exactly these columns.
+        """
+        found = {rid for rid in self._base_equal("lookup", key) if rid not in self.overlay}
+        found |= {rid for rid, row in self.overlay.items() if row is not None and _equal(row, key)}
+        return found
+
+    def match(self, where: Where = None) -> list[int]:
+        """Return the rowids matching ``where``; see :meth:`Table.match`.
+
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: the matching rowids.
+        """
+        if where is None or callable(where):
+            return [rid for rid, row in self.scan() if where is None or where(MappingProxyType(row))]
+        wanted = {c: self.schema.column(c).prepare(v) for c, v in where.items()}
+        found = [rid for rid in self._base_equal("match", wanted) if rid not in self.overlay]
+        found += [rid for rid, row in self.overlay.items() if row is not None and _equal(row, wanted)]
+        return found
+
+    def new_rowid(self) -> int:
+        """Hand out a new rowid from the table's counter.
+
+        :return: a rowid nobody has ever had.
+        """
+        return self.base.new_rowid()
+
+    def row(self, rowid: int) -> Row:
+        """Return the row as this transaction sees it.
+
+        :param rowid: the row to fetch.
+        :return: the row; callers must never mutate it.
+        :raises KeyError: if the row doesn't exist here.
+        """
+        row = self.overlay[rowid] if rowid in self.overlay else self._base_row(rowid)
+        if row is None:
+            raise KeyError(rowid)
+        return row
 
     def scan(self) -> Iterator[tuple[int, Row]]:
         """Yield every ``(rowid, row)`` pair this transaction sees, rows copied.
@@ -122,30 +194,6 @@ class TableView:
             if row is not None and rowid not in seen:
                 yield rowid, dict(row)
 
-    def match(self, where: Where = None) -> list[int]:
-        """Return the rowids matching ``where``; see :meth:`Table.match`.
-
-        :param where: a predicate, a dict of equalities, or ``None`` for all.
-        :return: the matching rowids.
-        """
-        if where is None or callable(where):
-            return [rid for rid, row in self.scan() if where is None or where(MappingProxyType(row))]
-        wanted = {c: self.schema.column(c).prepare(v) for c, v in where.items()}
-        found = [rid for rid in self._base_equal("match", wanted) if rid not in self.overlay]
-        found += [rid for rid, row in self.overlay.items() if row is not None and _equal(row, wanted)]
-        return found
-
-    def lookup(self, key: Mapping[str, Value | None]) -> set[int]:
-        """Return the rowids whose columns equal ``key``, as the index would.
-
-        :param key: ``{column: value}``.
-        :return: the matching rowids.
-        :raises SchemaError: if no index covers exactly these columns.
-        """
-        found = {rid for rid in self._base_equal("lookup", key) if rid not in self.overlay}
-        found |= {rid for rid, row in self.overlay.items() if row is not None and _equal(row, key)}
-        return found
-
     def select(self, where: Where = None) -> list[Row]:
         """Return copies of the rows matching ``where``.
 
@@ -161,24 +209,14 @@ class TableView:
         """
         return self.base.unique_keys()
 
-    def new_rowid(self) -> int:
-        """Hand out a new rowid from the table's counter.
-
-        :return: a rowid nobody has ever had.
-        """
-        return self.base.new_rowid()
-
-    def __len__(self) -> int:
-        return sum(1 for _ in self.scan())
-
     # -- validation; the caller holds the exclusive lock ----------------------------------
-    def conflicts(self) -> str | None:
-        """Describe the first recorded read that is no longer true.
 
-        :return: a description of the conflict, or ``None`` if every read
-            still holds.
-        """
-        return self._scan_conflict() or self._row_conflict() or self._key_conflict() or self._range_conflict()
+    def _key_conflict(self) -> str | None:
+        for (kind, key), seen in self.key_reads.items():
+            now = self.base.lookup(dict(key)) if kind == "lookup" else set(self.base.match(dict(key)))
+            if frozenset(now) != seen:
+                return f"{self.name} rows matching {dict(key)} changed"
+        return None
 
     def _range_conflict(self) -> str | None:
         for (column, lo, hi, lo_inclusive, hi_inclusive), seen in self.range_reads.items():
@@ -187,23 +225,31 @@ class TableView:
                 return f"{self.name} rows with {column} in range changed"
         return None
 
-    def _scan_conflict(self) -> str | None:
-        if self.scanned_version is not None and self.base.version != self.scanned_version:
-            return f"{self.name} changed since it was scanned"
-        return None
-
     def _row_conflict(self) -> str | None:
         for rowid, version in self.row_reads.items():
             if self.base.row_versions.get(rowid) != version:
                 return f"{self.name} row {rowid} changed since it was read"
         return None
 
-    def _key_conflict(self) -> str | None:
-        for (kind, key), seen in self.key_reads.items():
-            now = self.base.lookup(dict(key)) if kind == "lookup" else set(self.base.match(dict(key)))
-            if frozenset(now) != seen:
-                return f"{self.name} rows matching {dict(key)} changed"
+    def _scan_conflict(self) -> str | None:
+        if self.scanned_version is not None and self.base.version != self.scanned_version:
+            return f"{self.name} changed since it was scanned"
         return None
+
+    def committed(self) -> Table:
+        """Return the committed table behind this view, for statistics and indexes.
+
+        :return: the table.
+        """
+        return self.base
+
+    def conflicts(self) -> str | None:
+        """Describe the first recorded read that is no longer true.
+
+        :return: a description of the conflict, or ``None`` if every read
+            still holds.
+        """
+        return self._scan_conflict() or self._row_conflict() or self._key_conflict() or self._range_conflict()
 
     def range(
         self,
@@ -235,40 +281,9 @@ class TableView:
         found += [rid for rid, row in self.overlay.items() if row is not None and _in_range(row[column], bounds)]
         return found
 
-    def committed(self) -> Table:
-        """Return the committed table behind this view, for statistics and indexes.
 
-        :return: the table.
-        """
-        return self.base
-
-
-def _equal(row: Mapping[str, Value | None], key: Mapping[str, Value | None]) -> bool:
-    """Compare like SQL on every column of ``key``: NULL never equals anything."""
-    return all(v is not None and row[c] == v for c, v in key.items())
-
-
-def _freeze(key: Mapping[str, Value | None]) -> tuple[tuple[str, Value | None], ...]:
-    return tuple(sorted(key.items(), key=lambda kv: kv[0]))
-
-
-class Record(dict[str, "Value | None"]):
-    """Hold a row loaded through a unit of work; mutate it, and commit saves it.
-
-    :param table: the table the row is in.
-    :param rowid: the row's rowid.
-    :param row: its current values.
-    """
-
-    def __init__(self, table: str, rowid: int, row: Row) -> None:
-        super().__init__(row)
-        self.table, self.rowid = table, rowid
-
-    def __repr__(self) -> str:
-        return f"Record({self.table}#{self.rowid}, {dict.__repr__(self)})"
-
-
-_MISSING = object()
+class TransactionError(DatabaseError):
+    """Signal that a unit of work was used in the wrong state, e.g. after commit."""
 
 
 class UnitOfWork:
@@ -325,6 +340,7 @@ class UnitOfWork:
         return nullcontext(self)
 
     # -- the planner "state" interface ---------------------------------------------------
+
     @property
     def foreign_keys(self) -> Sequence[ForeignKey]:
         """Return the database's foreign keys."""
@@ -343,6 +359,41 @@ class UnitOfWork:
         return view
 
     # -- writes: plan now, against the workspace -------------------------------------------
+
+    def _record(self, changes: list[Change]) -> None:
+        """Put planned changes into the overlays, and keep loaded records current."""
+        for c in changes:
+            self.table(c.table).overlay[c.rowid] = c.after
+            self._changes.append(c)
+            key = (c.table, c.rowid)
+            if key in self._identity:
+                self._refresh(key, c.after)
+
+    def _refresh(self, key: tuple[str, int], after: Row | None) -> None:
+        if after is None:
+            del self._identity[key], self._snapshots[key]
+            return
+        record = self._identity[key]
+        record.clear()
+        record.update(after)
+        self._snapshots[key] = dict(after)
+
+    def delete(self, table: str, where: Where = None) -> int:
+        """Delete rows, and their cascades, from the workspace.
+
+        :param table: the table's name.
+        :param where: which rows go; ``None`` (the default) for all.
+        :return: the number of rows deleted from ``table`` itself.
+        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
+        :raises TransactionError: if the unit of work is no longer active,
+            or is read-only.
+        """
+        self._require_active(writing=True)
+        self.flush()
+        planned = ch.plan_delete(self, table, where, check=not self.deferred)
+        self._record(planned)
+        return sum(1 for c in planned if c.table == table and c.kind == "delete")
+
     def insert(self, table: str, values: Mapping[str, object]) -> int:
         """Insert a row into the workspace.
 
@@ -376,41 +427,19 @@ class UnitOfWork:
         self._record(planned)
         return len(planned)
 
-    def delete(self, table: str, where: Where = None) -> int:
-        """Delete rows, and their cascades, from the workspace.
+    # -- reads -------------------------------------------------------------------------
+
+    def find(self, table: str, where: Where = None) -> list[Record]:
+        """Return the matching rows as tracked records.
 
         :param table: the table's name.
-        :param where: which rows go; ``None`` (the default) for all.
-        :return: the number of rows deleted from ``table`` itself.
-        :raises ForeignKeyError: if a ``restrict`` reference forbids it.
-        :raises TransactionError: if the unit of work is no longer active,
-            or is read-only.
+        :param where: a predicate, a dict of equalities, or ``None`` for all.
+        :return: one record per matching row.
         """
-        self._require_active(writing=True)
         self.flush()
-        planned = ch.plan_delete(self, table, where, check=not self.deferred)
-        self._record(planned)
-        return sum(1 for c in planned if c.table == table and c.kind == "delete")
+        records = [self.get(table, rid) for rid in self.table(table).match(where)]
+        return [r for r in records if r is not None]
 
-    def _record(self, changes: list[Change]) -> None:
-        """Put planned changes into the overlays, and keep loaded records current."""
-        for c in changes:
-            self.table(c.table).overlay[c.rowid] = c.after
-            self._changes.append(c)
-            key = (c.table, c.rowid)
-            if key in self._identity:
-                self._refresh(key, c.after)
-
-    def _refresh(self, key: tuple[str, int], after: Row | None) -> None:
-        if after is None:
-            del self._identity[key], self._snapshots[key]
-            return
-        record = self._identity[key]
-        record.clear()
-        record.update(after)
-        self._snapshots[key] = dict(after)
-
-    # -- reads -------------------------------------------------------------------------
     def get(self, table: str, rowid: int) -> Record | None:
         """Return the row as a tracked :class:`Record`; one object per row.
 
@@ -430,16 +459,15 @@ class UnitOfWork:
         self._snapshots[key] = dict(row)
         return record
 
-    def find(self, table: str, where: Where = None) -> list[Record]:
-        """Return the matching rows as tracked records.
+    def query(self, table: str, alias: str | None = None) -> Query:
+        """Start a query that sees this transaction's changes.
 
-        :param table: the table's name.
-        :param where: a predicate, a dict of equalities, or ``None`` for all.
-        :return: one record per matching row.
+        :param table: the first table.
+        :param alias: its alias; ``None`` (the default) uses its name.
+        :return: a query to extend and run.
         """
         self.flush()
-        records = [self.get(table, rid) for rid in self.table(table).match(where)]
-        return [r for r in records if r is not None]
+        return Query(self, table, alias)
 
     def select(self, table: str, where: Where = None) -> list[Row]:
         """Return copies of the matching rows, as this transaction sees them.
@@ -451,17 +479,8 @@ class UnitOfWork:
         self.flush()
         return self.table(table).select(where)
 
-    def query(self, table: str, alias: str | None = None) -> Query:
-        """Start a query that sees this transaction's changes.
-
-        :param table: the first table.
-        :param alias: its alias; ``None`` (the default) uses its name.
-        :return: a query to extend and run.
-        """
-        self.flush()
-        return Query(self, table, alias)
-
     # -- dirty checking ---------------------------------------------------------------------
+
     def flush(self) -> None:
         """Turn modifications of loaded records into planned updates.
 
@@ -477,6 +496,41 @@ class UnitOfWork:
                 self._record(ch.plan_update(self, key[0], diff, rowids=[key[1]], check=not self.deferred))
 
     # -- finishing ---------------------------------------------------------------------
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> None:
+        if self.state != "active":
+            return
+        if exc_type is not None:
+            self.rollback()
+            return
+        try:
+            self.commit()
+        except BaseException:
+            self.rollback()
+            raise
+
+    def _apply(self) -> None:
+        if self.deferred:
+            ch.check_deferred(self, self._changes)
+        self.db.apply(ch.net_changes(self._changes))
+
+    def _require_active(self, *, writing: bool = False) -> None:
+        if self.state != "active":
+            raise TransactionError(f"unit of work is already {self.state}")
+        if writing and self.readonly:
+            raise TransactionError("cannot write in a read-only unit of work")
+
+    def _validate(self) -> None:
+        for view in self._views.values():
+            problem = view.conflicts()
+            if problem:
+                raise ConflictError(problem)
+
     def commit(self) -> None:
         """Flush, then validate and apply, in the way this unit of work's mode requires.
 
@@ -500,17 +554,6 @@ class UnitOfWork:
         self.state = "committed"
         self.db.end(self)
 
-    def _validate(self) -> None:
-        for view in self._views.values():
-            problem = view.conflicts()
-            if problem:
-                raise ConflictError(problem)
-
-    def _apply(self) -> None:
-        if self.deferred:
-            ch.check_deferred(self, self._changes)
-        self.db.apply(ch.net_changes(self._changes))
-
     def rollback(self) -> None:
         """Forget every change and release any lock held.
 
@@ -522,40 +565,3 @@ class UnitOfWork:
         self._identity.clear()
         self.state = "rolled back"
         self.db.end(self)
-
-    def _require_active(self, *, writing: bool = False) -> None:
-        if self.state != "active":
-            raise TransactionError(f"unit of work is already {self.state}")
-        if writing and self.readonly:
-            raise TransactionError("cannot write in a read-only unit of work")
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(
-        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
-    ) -> None:
-        if self.state != "active":
-            return
-        if exc_type is not None:
-            self.rollback()
-            return
-        try:
-            self.commit()
-        except BaseException:
-            self.rollback()
-            raise
-
-
-type RangeRead = tuple[str, Value | None, Value | None, bool, bool]  # column, lo, hi, inclusive?
-
-
-def _in_range(value: Value | None, bounds: RangeRead) -> bool:
-    """Tell whether ``value`` lies within ``bounds``; NULL never does."""
-    _, lo, hi, lo_inclusive, hi_inclusive = bounds
-    if value is None:
-        return False
-    v = ordered(value)
-    if lo is not None and (v < ordered(lo) or (value == lo and not lo_inclusive)):
-        return False
-    return not (hi is not None and (v > ordered(hi) or (value == hi and not hi_inclusive)))
