@@ -26,6 +26,9 @@ from minidb.schema import Check
 from minidb.schema import Column
 from minidb.schema import ForeignKey
 from minidb.schema import TableSchema
+from minidb.sql import Connection
+from minidb.sql import SQLError
+from minidb.sql import connect
 from minidb.storage import Format
 from minidb.storage import JsonFormat
 from minidb.storage import Storage
@@ -48,6 +51,7 @@ __all__ = [
     "CheckError",
     "Column",
     "ConflictError",
+    "Connection",
     "ConstraintError",
     "Count",
     "Database",
@@ -68,6 +72,7 @@ __all__ = [
     "Query",
     "Real",
     "Record",
+    "SQLError",
     "SchemaError",
     "Storage",
     "Sum",
@@ -78,6 +83,7 @@ __all__ = [
     "UniqueError",
     "UnitOfWork",
     "col",
+    "connect",
     "lit",
     "normalizers",
 ]
