@@ -7,11 +7,11 @@
 <p align="center"><em>A little speaker making a very loud noise: small in size, big in decibels (dB), hence the name.</em></p>
 
 <p align="center">
-  <a href="https://pypi.org/project/mini-db/"><img src="https://img.shields.io/pypi/v/mini-db" alt="PyPI version"></a>
-  <a href="https://pypi.org/project/mini-db/"><img src="https://img.shields.io/pypi/pyversions/mini-db" alt="Python versions"></a>
+  <a href="https://pypi.org/project/minidb-book/"><img src="https://img.shields.io/pypi/v/minidb-book" alt="PyPI version"></a>
+  <a href="https://pypi.org/project/minidb-book/"><img src="https://img.shields.io/pypi/pyversions/minidb-book" alt="Python versions"></a>
   <a href="https://github.com/stefano-bragaglia/mini-db-book/actions/workflows/ci.yml"><img src="https://github.com/stefano-bragaglia/mini-db-book/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/stefano-bragaglia/mini-db-book/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/mini-db" alt="License: MIT"></a>
-  <a href="https://pypi.org/project/mini-db/"><img src="https://img.shields.io/pypi/dm/mini-db" alt="Downloads"></a>
+  <a href="https://github.com/stefano-bragaglia/mini-db-book/blob/main/LICENSE"><img src="https://img.shields.io/pypi/l/minidb-book" alt="License: MIT"></a>
+  <a href="https://pypi.org/project/minidb-book/"><img src="https://img.shields.io/pypi/dm/minidb-book" alt="Downloads"></a>
   <a href="https://docs.astral.sh/ruff/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json" alt="Ruff"></a>
   <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/uv/main/assets/badge/v0.json" alt="uv"></a>
   <img src="https://img.shields.io/badge/typing-strict-blue" alt="Typed">
@@ -47,12 +47,12 @@ The book is complete and the code follows it chapter by chapter, through all fif
 
 ## Installation
 
-Requires Python 3.14 or later. The distribution is called `mini-db`; the package you import is `minidb`.
+Requires Python 3.14 or later. The distribution is called `minidb-book`; the package you import is `minidb`.
 
 ```sh
-pip install mini-db
+pip install minidb-book
 # or
-uv add mini-db
+uv add minidb-book
 ```
 
 To work on the code or follow the book, clone the repository and use [uv](https://docs.astral.sh/uv/):
