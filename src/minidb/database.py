@@ -166,15 +166,16 @@ class Database:
         except KeyError:
             raise SchemaError(f"no such table: {name!r}") from None
 
-    def create_index(self, table: str, name: str, columns: Sequence[str], *, unique: bool = False) -> None:
+    def create_index(self, table: str, name: str, columns: Sequence[str], *, unique: bool = False, kind: str = "hash") -> None:
         """Create an index on ``table``; see :meth:`Table.create_index`.
 
         :param table: the table's name.
         :param name: the index's name.
         :param columns: the indexed columns, in key order.
         :param unique: whether to refuse duplicate keys; ``False`` by default.
+        :param kind: ``"hash"`` (default) or ``"sorted"``.
         """
-        self.table(table).create_index(name, columns, unique=unique)
+        self.table(table).create_index(name, columns, unique=unique, kind=kind)
 
     # -- reads ---------------------------------------------------------------------
     def get(self, table: str, rowid: int) -> Row | None:
@@ -443,3 +444,9 @@ class Database:
         """Close the attached storage's files, if any."""
         if self.storage is not None:
             self.storage.close()
+
+    def analyze(self) -> None:
+        """Count the distinct values of every column, for the planner (like SQL's ANALYZE)."""
+        with self.reading():
+            for t in self.tables.values():
+                t.stats = {c: len({row[c] for row in t.rows.values()} - {None}) for c in t.columns}

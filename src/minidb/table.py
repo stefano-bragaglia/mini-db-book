@@ -8,10 +8,14 @@ reads.
 import threading
 from types import MappingProxyType
 from typing import TYPE_CHECKING
+from typing import Sequence
 
 from minidb.errors import SchemaError
 from minidb.errors import UniqueError
 from minidb.index import HashIndex
+from minidb.index import IndexFactory
+from minidb.index import OrderedIndex
+from minidb.index import SortedIndex
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -26,6 +30,8 @@ if TYPE_CHECKING:
 
 type Predicate = Callable[[Mapping[str, Value | None]], object]
 type Where = Predicate | Mapping[str, object] | None
+
+INDEX_KINDS: dict[str, IndexFactory] = {"hash": HashIndex, "sorted": SortedIndex}
 
 
 class Table:
@@ -47,8 +53,9 @@ class Table:
         self.columns = schema.column_names
         self.rows: dict[int, Row] = {}
         self.indexes: dict[str, Index] = {}
-        self.version = 0  # the last commit that changed this table
-        self.row_versions: dict[int, int] = {}  # rowid -> the last commit that changed it
+        self.stats: dict[str, int] = {}  # column -> number of distinct values
+        self.version = 0
+        self.row_versions: dict[int, int] = {}
         self._next_rowid = 1
         self._rowid_latch = threading.Lock()
         if schema.primary_key:
@@ -73,29 +80,74 @@ class Table:
             self._next_rowid = max(self._next_rowid, rowid + 1)
 
     # -- indexes ------------------------------------------------------------------
-    def create_index(self, name: str, columns: Iterable[str], *, unique: bool = False) -> Index:
+    def create_index(
+        self, name: str, columns: Iterable[str], *, unique: bool = False, kind: str = "hash"
+    ) -> Index:
         """Create an index over the existing rows, and maintain it from now on.
 
         :param name: the index's name.
         :param columns: the indexed columns, in key order.
         :param unique: whether to refuse duplicate keys; ``False`` by default.
+        :param kind: the kind of index, ``"hash"`` by default; see :data:`INDEX_KINDS`.
         :return: the new index.
-        :raises SchemaError: if the name is taken or a column is unknown.
+        :raises SchemaError: if the name is taken, the kind is unknown or a column is unknown.
         :raises UniqueError: if ``unique`` and existing rows share a key.
         """
         if name in self.indexes:
             raise SchemaError(f"{self.name}: index {name!r} already exists")
+        if kind not in INDEX_KINDS:
+            raise SchemaError(f"{self.name}: unknown index kind {kind!r}")
         columns = tuple(columns)
         for c in columns:
             self.schema.column(c)
-        index = HashIndex(name, columns, unique=unique)
-        for rowid, row in self.rows.items():
-            key = index.key_of(row)
-            if unique and key is not None and index.lookup(key):
-                raise UniqueError(f"{self.name}: cannot create unique index {name!r}: duplicate key {key}")
-            index.add(rowid, row)
+        index = INDEX_KINDS[kind](name, columns, unique=unique)
+        self._fill(index)
         self.indexes[name] = index
         return index
+
+    def _fill(self, index: Index) -> None:
+        """Add every existing row to a new index, refusing duplicates if it is unique."""
+        for rowid, row in self.rows.items():
+            key = index.key_of(row)
+            if index.unique and key is not None and index.lookup(key):
+                raise UniqueError(f"{self.name}: cannot create unique index {index.name!r}: duplicate key {key}")
+            index.add(rowid, row)
+
+    def range(
+        self,
+        column: str,
+        lo: Value | None = None,
+        hi: Value | None = None,
+        *,
+        lo_inclusive: bool = True,
+        hi_inclusive: bool = True,
+    ) -> list[int]:
+        """Return the rowids with ``lo <= column <= hi``, through an ordered index.
+
+        :param column: the column.
+        :param lo: the lower bound; ``None`` (the default) for none.
+        :param hi: the upper bound; ``None`` (the default) for none.
+        :param lo_inclusive: whether ``lo`` itself matches; ``True`` by default.
+        :param hi_inclusive: whether ``hi`` itself matches; ``True`` by default.
+        :return: the matching rowids, in key order.
+        :raises SchemaError: if no ordered index covers exactly ``column``.
+        """
+        index = next((i for i in self.indexes.values() if i.columns == (column,) and isinstance(i, OrderedIndex)), None)
+        if index is None:
+            raise SchemaError(f"{self.name}: no ordered index on {column!r}")
+        return index.range(
+            None if lo is None else (lo,),
+            None if hi is None else (hi,),
+            lo_inclusive=lo_inclusive,
+            hi_inclusive=hi_inclusive,
+        )
+
+    def committed(self) -> Table:
+        """Return the table itself: a table is its own committed state.
+
+        :return: ``self``.
+        """
+        return self
 
     def index_on(self, columns: Iterable[str]) -> Index | None:
         """Return an index on exactly these columns, in any order, or ``None``.

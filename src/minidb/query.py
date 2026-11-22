@@ -11,9 +11,11 @@ from minidb.operators import Distinct
 from minidb.operators import Filter
 from minidb.operators import Limit
 from minidb.operators import NestedLoopJoin
+from minidb.operators import PlannedSource
 from minidb.operators import Project
 from minidb.operators import Scan
 from minidb.operators import Sort
+from minidb.planner import Planner
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -27,15 +29,13 @@ if TYPE_CHECKING:
     from minidb.operators import RowFunction
     from minidb.operators import RowPredicate
     from minidb.operators import SortKey
-    from minidb.operators import Source
     from minidb.values import Value
 
 
-# src/minidb/query.py (replace QueryState)
 class QueryState(Protocol):
     """Describe where a query finds its tables, and how it protects its reads."""
 
-    def table(self, name: str) -> Source:
+    def table(self, name: str) -> PlannedSource:
         """Return the table (or view) called ``name``."""
         ...
 
@@ -151,7 +151,14 @@ class Query:
 
     # -- planning ---------------------------------------------------------------
     def plan(self) -> Operator:
-        """Assemble the operator tree, in SQL's order of evaluation.
+        """Return the physical plan chosen by the cost-based planner.
+
+        :return: the root operator.
+        """
+        return Planner(self).plan()
+
+    def plan_naive(self) -> Operator:
+        """Return Chapter 7's plan: joins in the written order, every filter on top.
 
         :return: the root operator.
         """
@@ -160,14 +167,24 @@ class Query:
             op = NestedLoopJoin(op, Scan(self.state.table(jtable), jalias), on, kind)
         for predicate in self.filters:
             op = Filter(op, predicate)
+        return self.finish_plan(op)
+
+    def finish_plan(self, op: Operator) -> Operator:
+        """Add GROUP BY, HAVING, ORDER BY, SELECT, DISTINCT and LIMIT on top of ``op``.
+
+        :param op: the plan for FROM, JOIN and WHERE.
+        :return: the complete plan.
+        """
+        return self._shape(self._group(op))
+
+    def _group(self, op: Operator) -> Operator:
         if self.grouping is not None:
             op = Aggregate(op, list(self.grouping), self.aggregates)
         for predicate in self.having_filters:
             op = Filter(op, predicate)
-        return self._finish(op)
+        return op
 
-    def _finish(self, op: Operator) -> Operator:
-        """Add ORDER BY, SELECT, DISTINCT and LIMIT on top of ``op``."""
+    def _shape(self, op: Operator) -> Operator:
         if self.ordering:
             op = Sort(op, list(self.ordering))
         if self.outputs is not None:

@@ -4,21 +4,26 @@ Every operator is iterable: it yields :class:`Row` objects, which it gets by
 iterating over its child operators. A query is a tree of operators, and
 iterating over the root makes rows flow up from the leaves.
 """
-import itertools
-from typing import cast
-from typing import Literal
-from typing import override
-from typing import Protocol
-from typing import TYPE_CHECKING
 
+import itertools
+from typing import TYPE_CHECKING
+from typing import Literal
+from typing import Protocol
+from typing import cast
+from typing import override
+
+from minidb.schema import TableSchema
+from minidb.values import Ordered
 from minidb.values import arithmetic
 from minidb.values import ordered
-from minidb.values import Ordered
 
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from collections.abc import Mapping
 
+    from minidb.schema import TableSchema
+    from minidb.table import Table
     from minidb.values import Row as StoredRow
     from minidb.values import Value
 
@@ -64,14 +69,15 @@ class Source(Protocol):
         ...
 
 
-# src/minidb/operators.py (append)
 class Operator:
     """Produce rows when iterated; the base class of every operator.
 
     Subclasses implement :meth:`__iter__`, :meth:`columns` and :attr:`label`.
+    The planner sets :attr:`estimate`, the number of rows it expects.
     """
 
     children: tuple[Operator, ...] = ()
+    estimate: float | None = None
 
     def __iter__(self) -> Iterator[Row]:
         raise NotImplementedError
@@ -89,15 +95,15 @@ class Operator:
         return type(self).__name__
 
     def explain(self, indent: int = 0) -> str:
-        """Describe the operator tree rooted here, one operator per line.
+        """Describe the operator tree rooted here, one operator per line, with estimates.
 
         :param indent: the nesting depth of this operator; 0 by default.
         :return: the indented description.
         """
-        lines = ["  " * indent + self.label]
-        lines += [child.explain(indent + 1) for child in self.children]
-        return "\n".join(lines)
-
+        line = "  " * indent + self.label
+        if self.estimate is not None:
+            line += f"  [~{self.estimate:,.0f} rows]"
+        return "\n".join([line] + [child.explain(indent + 1) for child in self.children])
 
 class Scan(Operator):
     """Yield every row of a source, with names qualified by ``alias``.
@@ -198,7 +204,7 @@ class NestedLoopJoin(Operator):
     """
 
     def __init__(
-            self, left: Operator, right: Operator, on: RowPredicate | None = None, kind: JoinKind = "inner"
+        self, left: Operator, right: Operator, on: RowPredicate | None = None, kind: JoinKind = "inner"
     ) -> None:
         if kind not in ("inner", "left"):
             raise ValueError("kind must be 'inner' or 'left'")
@@ -448,7 +454,7 @@ class Aggregate(Operator):
     """
 
     def __init__(
-            self, child: Operator, group_by: list[str], aggregates: dict[str, AggregateFunction[Accumulator]]
+        self, child: Operator, group_by: list[str], aggregates: dict[str, AggregateFunction[Accumulator]]
     ) -> None:
         self.children = (child,)
         self.group_by, self.aggregates = list(group_by), aggregates
@@ -487,3 +493,33 @@ class Aggregate(Operator):
     def label(self) -> str:
         aggs = ", ".join(f"{n}={f!r}" for n, f in self.aggregates.items())
         return f"Aggregate by {self.group_by or '()'}: {aggs}"
+
+
+class PlannedSource(Source, Protocol):
+    """Describe what the planner needs from a source: rows, indexes, and the committed table."""
+
+    schema: TableSchema
+
+    def row(self, rowid: int) -> StoredRow:
+        """Return the stored row itself."""
+        ...
+
+    def lookup(self, key: Mapping[str, Value | None]) -> set[int]:
+        """Return the rowids whose columns equal ``key``, through an index."""
+        ...
+
+    def range(
+        self,
+        column: str,
+        lo: Value | None = None,
+        hi: Value | None = None,
+        *,
+        lo_inclusive: bool = True,
+        hi_inclusive: bool = True,
+    ) -> list[int]:
+        """Return the rowids within the bounds, through an ordered index."""
+        ...
+
+    def committed(self) -> Table:
+        """Return the committed table, for its statistics and indexes."""
+        ...

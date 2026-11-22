@@ -14,6 +14,7 @@ from minidb import changes as ch
 from minidb.errors import ConflictError
 from minidb.errors import DatabaseError
 from minidb.query import Query
+from minidb.values import ordered
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -31,6 +32,18 @@ if TYPE_CHECKING:
     from minidb.values import Value
 
 type ReadKey = tuple[str, tuple[tuple[str, Value | None], ...]]  # ("lookup" | "match", frozen key)
+type RangeRead = tuple[str, Value | None, Value | None, bool, bool]  # column, lo, hi, inclusive?
+
+
+def _in_range(value: Value | None, bounds: RangeRead) -> bool:
+    """Tell whether ``value`` lies within ``bounds``; NULL never does."""
+    _, lo, hi, lo_inclusive, hi_inclusive = bounds
+    if value is None:
+        return False
+    v = ordered(value)
+    if lo is not None and (v < ordered(lo) or (value == lo and not lo_inclusive)):
+        return False
+    return not (hi is not None and (v > ordered(hi) or (value == hi and not hi_inclusive)))
 
 
 class TransactionError(DatabaseError):
@@ -56,6 +69,7 @@ class TableView:
         self.scanned_version: int | None = None  # table version at the first scan
         self.row_reads: dict[int, int | None] = {}  # rowid -> row version read
         self.key_reads: dict[ReadKey, frozenset[int]] = {}  # equality read -> rowids seen
+        self.range_reads: dict[RangeRead, frozenset[int]] = {}  # range read -> rowids seen
 
     # -- reads of committed data, latched and recorded ----------------------------------
     def _base_row(self, rowid: int) -> Row | None:
@@ -176,7 +190,14 @@ class TableView:
         :return: a description of the conflict, or ``None`` if every read
             still holds.
         """
-        return self._scan_conflict() or self._row_conflict() or self._key_conflict()
+        return self._scan_conflict() or self._row_conflict() or self._key_conflict() or self._range_conflict()
+
+    def _range_conflict(self) -> str | None:
+        for (column, lo, hi, lo_inclusive, hi_inclusive), seen in self.range_reads.items():
+            now = self.base.range(column, lo, hi, lo_inclusive=lo_inclusive, hi_inclusive=hi_inclusive)
+            if frozenset(now) != seen:
+                return f"{self.name} rows with {column} in range changed"
+        return None
 
     def _scan_conflict(self) -> str | None:
         if self.scanned_version is not None and self.base.version != self.scanned_version:
@@ -195,6 +216,43 @@ class TableView:
             if frozenset(now) != seen:
                 return f"{self.name} rows matching {dict(key)} changed"
         return None
+
+    def range(
+        self,
+        column: str,
+        lo: Value | None = None,
+        hi: Value | None = None,
+        *,
+        lo_inclusive: bool = True,
+        hi_inclusive: bool = True,
+    ) -> list[int]:
+        """Return the rowids with ``lo <= column <= hi``, as this transaction sees them.
+
+        The committed part of the answer is recorded in the read set.
+
+        :param column: the column.
+        :param lo: the lower bound; ``None`` (the default) for none.
+        :param hi: the upper bound; ``None`` (the default) for none.
+        :param lo_inclusive: whether ``lo`` itself matches; ``True`` by default.
+        :param hi_inclusive: whether ``hi`` itself matches; ``True`` by default.
+        :return: the matching rowids: committed ones in key order, then this
+            transaction's.
+        :raises SchemaError: if no ordered index covers exactly ``column``.
+        """
+        bounds: RangeRead = (column, lo, hi, lo_inclusive, hi_inclusive)
+        with self.uow.latch():
+            found = self.base.range(column, lo, hi, lo_inclusive=lo_inclusive, hi_inclusive=hi_inclusive)
+        self.range_reads.setdefault(bounds, frozenset(found))
+        found = [rid for rid in found if rid not in self.overlay]
+        found += [rid for rid, row in self.overlay.items() if row is not None and _in_range(row[column], bounds)]
+        return found
+
+    def committed(self) -> Table:
+        """Return the committed table behind this view, for statistics and indexes.
+
+        :return: the table.
+        """
+        return self.base
 
 
 def _equal(row: Mapping[str, Value | None], key: Mapping[str, Value | None]) -> bool:

@@ -12,6 +12,9 @@ from minidb.errors import ForeignKeyError
 from minidb.errors import NotNullError
 from minidb.errors import SchemaError
 from minidb.errors import UniqueError
+from minidb.expr import Expr
+from minidb.expr import col
+from minidb.expr import lit
 from minidb.locks import FairRWLock
 from minidb.operators import Avg
 from minidb.operators import Count
@@ -51,6 +54,7 @@ __all__ = [
     "DatabaseError",
     "Date",
     "DomainError",
+    "Expr",
     "FairRWLock",
     "ForeignKey",
     "ForeignKeyError",
@@ -73,6 +77,8 @@ __all__ = [
     "TransactionError",
     "UniqueError",
     "UnitOfWork",
+    "col",
+    "lit",
     "normalizers",
 ]
 
