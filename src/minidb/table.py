@@ -5,6 +5,7 @@ the two write primitives, :meth:`Table.put` and :meth:`Table.remove`, and
 reads.
 """
 
+import threading
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
@@ -46,7 +47,10 @@ class Table:
         self.columns = schema.column_names
         self.rows: dict[int, Row] = {}
         self.indexes: dict[str, Index] = {}
+        self.version = 0  # the last commit that changed this table
+        self.row_versions: dict[int, int] = {}  # rowid -> the last commit that changed it
         self._next_rowid = 1
+        self._rowid_latch = threading.Lock()
         if schema.primary_key:
             self.create_index("pk", schema.primary_key, unique=True)
         for cols in schema.unique:
@@ -123,11 +127,15 @@ class Table:
     def new_rowid(self) -> int:
         """Hand out the next rowid; rowids are never reused.
 
+        Planning happens outside the exclusive lock, so the counter has a
+        small latch of its own.
+
         :return: a rowid no row has ever had.
         """
-        rowid = self._next_rowid
-        self._next_rowid += 1
-        return rowid
+        with self._rowid_latch:
+            rowid = self._next_rowid
+            self._next_rowid += 1
+            return rowid
 
     # -- reads -------------------------------------------------------------------------
     def row(self, rowid: int) -> Row:

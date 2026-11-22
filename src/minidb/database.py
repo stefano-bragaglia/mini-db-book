@@ -4,14 +4,15 @@ Every write is planned first (:mod:`minidb.changes`) and then applied by
 :meth:`Database.apply`, the only method that modifies tables.
 """
 
-from typing import Generator as Generator_1
+import random
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import replace
-from typing import Iterator
 from typing import TYPE_CHECKING
 
 from minidb import changes as ch
+from minidb.errors import ConflictError
 from minidb.errors import DatabaseError
 from minidb.errors import SchemaError
 from minidb.locks import FairRWLock
@@ -23,9 +24,11 @@ from minidb.uow import TransactionError
 from minidb.uow import UnitOfWork
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from collections.abc import Generator
     from collections.abc import Mapping
     from collections.abc import Sequence
+    from contextlib import AbstractContextManager
 
     from minidb.changes import Change
     from minidb.locks import RWLock
@@ -39,11 +42,27 @@ if TYPE_CHECKING:
 class Database:
     """Hold tables and the foreign keys between them, and run CRUD on them."""
 
+    # src/minidb/database.py (replace Database.__init__)
     def __init__(self, *, lock: RWLock | None = None) -> None:
         self.tables: dict[str, Table] = {}
         self.foreign_keys: list[ForeignKey] = []
+        self.commit_seq = 0  # the number of the last commit
         self._lock: RWLock = lock if lock is not None else FairRWLock()
         self._local = threading.local()  # .uow: this thread's active unit of work
+
+    def shared_lock(self) -> AbstractContextManager[None]:
+        """Return a context manager that holds the database lock in shared mode.
+
+        :return: the context manager.
+        """
+        return self._lock.read()
+
+    def exclusive_lock(self) -> AbstractContextManager[None]:
+        """Return a context manager that holds the database lock exclusively.
+
+        :return: the context manager.
+        """
+        return self._lock.write()
 
     # -- schema --------------------------------------------------------------------
     def create_table(
@@ -188,8 +207,7 @@ class Database:
         :return: the new rowid.
         :raises ConstraintError: if the row breaks a constraint.
         """
-        with self.unit_of_work() as uow:
-            return uow.insert(table, values)
+        return self.transaction(lambda uow: uow.insert(table, values))
 
     def update(self, table: str, changes: Mapping[str, object], where: Where = None) -> int:
         """Update rows, in a transaction of its own.
@@ -200,8 +218,7 @@ class Database:
         :return: the number of rows changed.
         :raises ConstraintError: if a new row breaks a constraint.
         """
-        with self.unit_of_work() as uow:
-            return uow.update(table, changes, where)
+        return self.transaction(lambda uow: uow.update(table, changes, where))
 
     def delete(self, table: str, where: Where = None) -> int:
         """Delete rows and their cascades, in a transaction of its own.
@@ -211,30 +228,80 @@ class Database:
         :return: the number of rows deleted from ``table`` itself.
         :raises ForeignKeyError: if a ``restrict`` reference forbids it.
         """
-        with self.unit_of_work() as uow:
-            return uow.delete(table, where)
+        return self.transaction(lambda uow: uow.delete(table, where))
 
     def apply(self, changes: Sequence[Change]) -> None:
-        """Write already-validated changes; the only method that modifies tables.
+        """Write validated changes as one commit, stamping every row with its version.
 
-        :param changes: the changes to write, in order.
+        The caller holds the exclusive lock.
+
+        :param changes: the changes to write.
         """
+        self.commit_seq += 1
+        seq = self.commit_seq
         for c in changes:
+            t = self.tables[c.table]
             if c.after is None:
-                self.tables[c.table].remove(c.rowid)
+                t.remove(c.rowid)
+                t.row_versions.pop(c.rowid, None)
             else:
-                self.tables[c.table].put(c.rowid, c.after)
+                t.put(c.rowid, c.after)
+                t.row_versions[c.rowid] = seq
+            t.version = seq
 
-    def unit_of_work(self, *, deferred: bool = False, readonly: bool = False) -> UnitOfWork:
+    # src/minidb/database.py (replace Database.unit_of_work)
+    def unit_of_work(self, *, deferred: bool = False, readonly: bool = False, exclusive: bool = False) -> UnitOfWork:
         """Start a transaction; see :class:`UnitOfWork`.
 
         :param deferred: whether to check multi-row constraints only at
             commit; ``False`` by default.
-        :param readonly: whether the transaction only reads, and so may
-            share the lock; ``False`` by default.
+        :param readonly: whether the transaction only reads; it then holds
+            the lock in shared mode and never conflicts; ``False`` by default.
+        :param exclusive: whether to hold the lock alone for the whole
+            transaction, so it can't conflict; ``False`` by default.
         :return: a new, active unit of work.
         """
-        return UnitOfWork(self, deferred=deferred, readonly=readonly)
+        return UnitOfWork(self, deferred=deferred, readonly=readonly, exclusive=exclusive)
+
+    def transaction[T](self, fn: Callable[[UnitOfWork], T], *, retries: int = 5, deferred: bool = False) -> T:
+        """Run ``fn(uow)`` and commit, retrying when another transaction conflicts.
+
+        ``fn`` may run several times, so it must not have effects outside
+        the database. After ``retries`` optimistic attempts, the final
+        attempt runs exclusively and can't conflict: every transaction
+        finishes.
+
+        >>> from minidb.schema import Column
+        >>> from minidb.types import Integer
+        >>> db = Database()
+        >>> _ = db.create_table("t", [Column("n", Integer())])
+        >>> db.transaction(lambda uow: uow.insert("t", {"n": 1}))
+        1
+
+        :param fn: the work to do, given a fresh unit of work each time.
+        :param retries: the optimistic attempts before the exclusive one; 5 by default.
+        :param deferred: whether to defer multi-row checks to commit; ``False`` by default.
+        :return: whatever ``fn`` returned on the attempt that committed.
+        :raises DatabaseError: whatever ``fn`` or the commit raised, other
+            than a conflict.
+        """
+        for attempt in range(retries):
+            try:
+                return self._attempt(self.unit_of_work(deferred=deferred), fn)
+            except ConflictError:
+                time.sleep(random.uniform(0, 0.0005 * 2**attempt))  # noqa: S311 - back-off jitter, not cryptography
+        return self._attempt(self.unit_of_work(deferred=deferred, exclusive=True), fn)
+
+    @staticmethod
+    def _attempt[T](uow: UnitOfWork, fn: Callable[[UnitOfWork], T]) -> T:
+        try:
+            result = fn(uow)
+            uow.commit()
+        except BaseException:
+            if uow.state == "active":
+                uow.rollback()
+            raise
+        return result
 
     # -- concurrency control ------------------------------------------------------------
     def active_unit_of_work(self) -> UnitOfWork | None:
@@ -246,9 +313,11 @@ class Database:
         return uow
 
     def begin(self, uow: UnitOfWork) -> None:
-        """Take the lock on behalf of a new unit of work: shared if it is read-only.
+        """Register a new unit of work, taking the lock it needs for its lifetime.
 
-        Units of work call this themselves; applications don't need to.
+        Optimistic units of work take no lock at all; read-only ones share
+        it; exclusive ones hold it alone. Units of work call this
+        themselves; applications don't need to.
 
         :param uow: the unit of work that is starting.
         :raises TransactionError: if the thread already has an active one.
@@ -257,23 +326,23 @@ class Database:
             raise TransactionError("this thread already has an active unit of work")
         if uow.readonly:
             self._lock.acquire_read()
-        else:
+        elif uow.exclusive:
             self._lock.acquire_write()
         self._local.uow = uow
 
     def end(self, uow: UnitOfWork) -> None:
-        """Release the lock when a unit of work commits or rolls back.
+        """Unregister a finishing unit of work, releasing any lock it held.
 
         :param uow: the unit of work that is finishing.
         """
         self._local.uow = None
         if uow.readonly:
             self._lock.release_read()
-        else:
+        elif uow.exclusive:
             self._lock.release_write()
 
     @contextmanager
-    def reading(self) -> Generator_1[Database]:
+    def reading(self) -> Generator[Database]:
         """Hold the lock in shared mode for one read outside any unit of work.
 
         :return: a context manager that yields the database.

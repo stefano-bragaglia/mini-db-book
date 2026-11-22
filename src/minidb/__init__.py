@@ -4,6 +4,7 @@ from minidb import normalizers
 from minidb.changes import Change
 from minidb.database import Database
 from minidb.errors import CheckError
+from minidb.errors import ConflictError
 from minidb.errors import ConstraintError
 from minidb.errors import DatabaseError
 from minidb.errors import DomainError
@@ -33,6 +34,7 @@ from minidb.uow import Record
 from minidb.uow import TransactionError
 from minidb.uow import UnitOfWork
 
+# src/minidb/__init__.py (replace __all__)
 __all__ = [
     "Avg",
     "Boolean",
@@ -40,6 +42,7 @@ __all__ = [
     "Check",
     "CheckError",
     "Column",
+    "ConflictError",
     "ConstraintError",
     "Count",
     "Database",

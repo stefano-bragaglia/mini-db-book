@@ -35,3 +35,9 @@ class UniqueError(ConstraintError):
 
 class ForeignKeyError(ConstraintError):
     """Signal a reference to a missing row, or a delete that would orphan rows."""
+
+
+class ConflictError(DatabaseError):
+    """Signal that a concurrent transaction changed something this one read; retry it."""
+
+

@@ -1,8 +1,8 @@
 """Group writes into all-or-nothing transactions: the Unit of Work.
 
-Version 2: every operation is planned at once against a private workspace,
-and the shared tables are only touched when :meth:`UnitOfWork.commit`
-applies the transaction's net changes in one step.
+Version 3: optimistic concurrency control. A read-write unit of work holds
+no lock while it runs. It records what it read (its *read set*), and at
+commit, under the exclusive lock, checks that all of it is still true.
 """
 
 from contextlib import nullcontext
@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from typing import Self
 
 from minidb import changes as ch
+from minidb.errors import ConflictError
 from minidb.errors import DatabaseError
 from minidb.query import Query
 
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from collections.abc import Mapping
     from collections.abc import Sequence
+    from contextlib import AbstractContextManager
     from types import TracebackType
 
     from minidb.changes import Change
@@ -28,7 +30,7 @@ if TYPE_CHECKING:
     from minidb.values import Row
     from minidb.values import Value
 
-_MISSING = object()
+type ReadKey = tuple[str, tuple[tuple[str, Value | None], ...]]  # ("lookup" | "match", frozen key)
 
 
 class TransactionError(DatabaseError):
@@ -36,31 +38,54 @@ class TransactionError(DatabaseError):
 
 
 class TableView:
-    """Show a table as one unit of work sees it: committed rows plus a private overlay.
+    """Show a table as one unit of work sees it, recording every read of committed data.
 
-    Reads look in the overlay first and fall through to the table; writes
-    only touch the overlay. The view satisfies the same protocols as a
-    table (:class:`~minidb.changes.TableLike` and
-    :class:`~minidb.operators.Source`), so planners and queries work on it
-    unchanged.
+    Each read of the committed table happens under a short shared latch,
+    and is remembered in the view's read set, so that commit can check it
+    is still true.
 
+    :param uow: the unit of work this view belongs to.
     :param table: the committed table.
     """
 
-    def __init__(self, table: Table) -> None:
-        self.base = table
+    def __init__(self, uow: UnitOfWork, table: Table) -> None:
+        self.uow, self.base = uow, table
         self.name, self.schema, self.columns = table.name, table.schema, table.columns
         self.overlay: dict[int, Row | None] = {}  # rowid -> row, None = deleted
+        # -- the read set -------------------------------------------------------------
+        self.scanned_version: int | None = None  # table version at the first scan
+        self.row_reads: dict[int, int | None] = {}  # rowid -> row version read
+        self.key_reads: dict[ReadKey, frozenset[int]] = {}  # equality read -> rowids seen
 
+    # -- reads of committed data, latched and recorded ----------------------------------
+    def _base_row(self, rowid: int) -> Row | None:
+        with self.uow.latch():
+            row = self.base.rows.get(rowid)
+            self.row_reads.setdefault(rowid, self.base.row_versions.get(rowid))
+        return row
+
+    def _base_items(self) -> list[tuple[int, Row]]:
+        with self.uow.latch():
+            items = list(self.base.rows.items())
+            if self.scanned_version is None:
+                self.scanned_version = self.base.version
+        return items
+
+    def _base_equal(self, kind: str, key: Mapping[str, Value | None]) -> set[int]:
+        with self.uow.latch():
+            found = self.base.lookup(key) if kind == "lookup" else set(self.base.match(key))
+        self.key_reads.setdefault((kind, _freeze(key)), frozenset(found))
+        return found
+
+    # -- the interface used by planners and queries ------------------------------------
     def row(self, rowid: int) -> Row:
         """Return the row as this transaction sees it.
 
         :param rowid: the row to fetch.
         :return: the row; callers must never mutate it.
-        :raises KeyError: if the row doesn't exist, or this transaction
-            deleted it.
+        :raises KeyError: if the row doesn't exist here.
         """
-        row = self.overlay[rowid] if rowid in self.overlay else self.base.row(rowid)
+        row = self.overlay[rowid] if rowid in self.overlay else self._base_row(rowid)
         if row is None:
             raise KeyError(rowid)
         return row
@@ -79,14 +104,20 @@ class TableView:
     def scan(self) -> Iterator[tuple[int, Row]]:
         """Yield every ``(rowid, row)`` pair this transaction sees, rows copied.
 
+        The committed rows are copied under the latch, and iterated without
+        it: a lock must never be held across a ``yield``.
+
         :return: committed rows (as changed here), then rows inserted here.
         """
-        for rowid, row in self.base.rows.items():
+        items = self._base_items()
+        seen: set[int] = set()
+        for rowid, row in items:
+            seen.add(rowid)
             current = self.overlay.get(rowid, row)
             if current is not None:
                 yield rowid, dict(current)
-        for rowid, row in self.overlay.items():  # rows inserted here
-            if row is not None and rowid not in self.base.rows:
+        for rowid, row in list(self.overlay.items()):  # rows inserted here
+            if row is not None and rowid not in seen:
                 yield rowid, dict(row)
 
     def match(self, where: Where = None) -> list[int]:
@@ -98,7 +129,7 @@ class TableView:
         if where is None or callable(where):
             return [rid for rid, row in self.scan() if where is None or where(MappingProxyType(row))]
         wanted = {c: self.schema.column(c).prepare(v) for c, v in where.items()}
-        found = [rid for rid in self.base.match(wanted) if rid not in self.overlay]
+        found = [rid for rid in self._base_equal("match", wanted) if rid not in self.overlay]
         found += [rid for rid, row in self.overlay.items() if row is not None and _equal(row, wanted)]
         return found
 
@@ -109,7 +140,7 @@ class TableView:
         :return: the matching rowids.
         :raises SchemaError: if no index covers exactly these columns.
         """
-        found = {rid for rid in self.base.lookup(key) if rid not in self.overlay}
+        found = {rid for rid in self._base_equal("lookup", key) if rid not in self.overlay}
         found |= {rid for rid, row in self.overlay.items() if row is not None and _equal(row, key)}
         return found
 
@@ -138,10 +169,41 @@ class TableView:
     def __len__(self) -> int:
         return sum(1 for _ in self.scan())
 
+    # -- validation; the caller holds the exclusive lock ----------------------------------
+    def conflicts(self) -> str | None:
+        """Describe the first recorded read that is no longer true.
+
+        :return: a description of the conflict, or ``None`` if every read
+            still holds.
+        """
+        return self._scan_conflict() or self._row_conflict() or self._key_conflict()
+
+    def _scan_conflict(self) -> str | None:
+        if self.scanned_version is not None and self.base.version != self.scanned_version:
+            return f"{self.name} changed since it was scanned"
+        return None
+
+    def _row_conflict(self) -> str | None:
+        for rowid, version in self.row_reads.items():
+            if self.base.row_versions.get(rowid) != version:
+                return f"{self.name} row {rowid} changed since it was read"
+        return None
+
+    def _key_conflict(self) -> str | None:
+        for (kind, key), seen in self.key_reads.items():
+            now = self.base.lookup(dict(key)) if kind == "lookup" else set(self.base.match(dict(key)))
+            if frozenset(now) != seen:
+                return f"{self.name} rows matching {dict(key)} changed"
+        return None
+
 
 def _equal(row: Mapping[str, Value | None], key: Mapping[str, Value | None]) -> bool:
     """Compare like SQL on every column of ``key``: NULL never equals anything."""
     return all(v is not None and row[c] == v for c, v in key.items())
+
+
+def _freeze(key: Mapping[str, Value | None]) -> tuple[tuple[str, Value | None], ...]:
+    return tuple(sorted(key.items(), key=lambda kv: kv[0]))
 
 
 class Record(dict[str, "Value | None"]):
@@ -160,31 +222,61 @@ class Record(dict[str, "Value | None"]):
         return f"Record({self.table}#{self.rowid}, {dict.__repr__(self)})"
 
 
-class UnitOfWork:
-    """Plan writes into a private workspace, and apply their net effect on commit.
+_MISSING = object()
 
-    The unit of work is itself a :class:`~minidb.changes.State` and a
-    :class:`~minidb.query.QueryState`: planners and queries read through it
-    and see the transaction's own changes. Rows loaded with :meth:`get` or
-    :meth:`find` are tracked in an identity map, and modifying one is
-    noticed and saved (dirty checking).
+
+class UnitOfWork:
+    """Plan writes into a private workspace; validate and apply them at commit.
+
+    There are three modes. By default the unit of work is *optimistic*: it
+    holds no lock while running, and validates its read set at commit. With
+    ``readonly=True`` it holds the lock in shared mode for its whole life,
+    and may not write. With ``exclusive=True`` it holds the lock alone for
+    its whole life, so it never conflicts.
 
     :param db: the database to write to.
-    :param deferred: whether to check uniqueness and references once, at
-        commit, over the final state, instead of after every operation;
-        ``False`` by default.
+    :param deferred: whether to check uniqueness and references only at
+        commit; ``False`` by default.
+    :param readonly: whether the transaction only reads; ``False`` by default.
+    :param exclusive: whether to hold the lock throughout; ``False`` by default.
+    :raises ValueError: if both ``readonly`` and ``exclusive`` are set.
     """
 
-    def __init__(self, db: Database, *, deferred: bool = False, readonly: bool = False) -> None:
+    def __init__(
+        self, db: Database, *, deferred: bool = False, readonly: bool = False, exclusive: bool = False
+    ) -> None:
+        if readonly and exclusive:
+            raise ValueError("a unit of work cannot be both readonly and exclusive")
         self.db = db
         self.deferred = deferred
         self.readonly = readonly
+        self.exclusive = exclusive
         self.state = "active"
         self._views: dict[str, TableView] = {}
         self._changes: list[Change] = []
         self._identity: dict[tuple[str, int], Record] = {}
         self._snapshots: dict[tuple[str, int], Row] = {}
+        self._committing = False
         db.begin(self)
+
+    def latch(self) -> AbstractContextManager[None]:
+        """Return the short lock to hold around each read of committed data.
+
+        It does nothing when the unit of work already holds the lock: being
+        read-only or exclusive, or in the middle of committing.
+
+        :return: a context manager.
+        """
+        if self.readonly or self.exclusive or self._committing:
+            return nullcontext()
+        return self.db.shared_lock()
+
+    def reading(self) -> nullcontext[Self]:
+        """Return a context manager for queries, which does nothing: views latch each read.
+
+        :return: a context manager that yields the unit of work.
+        """
+        return nullcontext(self)
 
     # -- the planner "state" interface ---------------------------------------------------
     @property
@@ -201,7 +293,7 @@ class UnitOfWork:
         """
         view = self._views.get(name)
         if view is None:
-            view = self._views[name] = TableView(self.db.table(name))
+            view = self._views[name] = TableView(self, self.db.table(name))
         return view
 
     # -- writes: plan now, against the workspace -------------------------------------------
@@ -340,22 +432,41 @@ class UnitOfWork:
 
     # -- finishing ---------------------------------------------------------------------
     def commit(self) -> None:
-        """Flush, run the deferred checks if any, apply the net changes, and release the lock.
+        """Flush, then validate and apply, in the way this unit of work's mode requires.
 
-        :raises ConstraintError: if a deferred check fails; the unit of
-            work then stays active and keeps the lock.
+        :raises ConflictError: if an optimistic unit of work read something
+            that has changed since; it then stays active, for a rollback.
+        :raises ConstraintError: if a deferred check fails.
         :raises TransactionError: if the unit of work is no longer active.
         """
         self._require_active()
         self.flush()
-        if self.deferred:
-            ch.check_deferred(self, self._changes)
-        self.db.apply(ch.net_changes(self._changes))
+        if self.exclusive:
+            self._apply()  # nobody else ran: nothing to validate
+        elif not self.readonly:
+            with self.db.exclusive_lock():  # the only exclusive section
+                self._committing = True
+                try:
+                    self._validate()
+                    self._apply()
+                finally:
+                    self._committing = False
         self.state = "committed"
         self.db.end(self)
 
+    def _validate(self) -> None:
+        for view in self._views.values():
+            problem = view.conflicts()
+            if problem:
+                raise ConflictError(problem)
+
+    def _apply(self) -> None:
+        if self.deferred:
+            ch.check_deferred(self, self._changes)
+        self.db.apply(ch.net_changes(self._changes))
+
     def rollback(self) -> None:
-        """Forget every change and release the lock.
+        """Forget every change and release any lock held.
 
         :raises TransactionError: if the unit of work is no longer active.
         """
@@ -386,12 +497,5 @@ class UnitOfWork:
         try:
             self.commit()
         except BaseException:
-            self.rollback()  # a failed commit must not stay open
+            self.rollback()
             raise
-
-    def reading(self) -> nullcontext[Self]:
-        """Return a context manager for reads, which does nothing: we hold the lock.
-
-        :return: a context manager that yields the unit of work.
-        """
-        return nullcontext(self)
